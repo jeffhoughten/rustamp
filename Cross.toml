@@ -1,0 +1,8 @@
+[target.armv7-unknown-linux-gnueabihf]
+image = "rustamp-cross-armv7"
+
+[target.aarch64-unknown-linux-gnu]
+image = "rustamp-cross-aarch64"
+
+[target.x86_64-unknown-linux-gnu]
+image = "rustamp-cross-x86_64"

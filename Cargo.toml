@@ -1,0 +1,29 @@
+[package]
+name = "plexamp-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+urlencoding = "2"
+rodio = { version = "0.21", default-features = false, features = ["symphonia-all"] }
+axum = "0.7"
+tower-http = { version = "0.5", features = ["fs"] }
+
+# Linux talks to ALSA directly (see src/audio.rs for why); every other
+# platform uses cpal.
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa = "0.9"
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+cpal = "0.15"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

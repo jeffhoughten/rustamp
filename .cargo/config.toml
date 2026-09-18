@@ -1,0 +1,8 @@
+[target.armv7-unknown-linux-gnueabihf]
+rustflags = ["-C", "target-cpu=cortex-a7"]
+
+# Raspberry Pi 5 (Cortex-A76). Harmless on other aarch64 hardware only if
+# you build separately for it — drop this section if you need one binary
+# that runs on older 64-bit Pis too.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=cortex-a76"]
