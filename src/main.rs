@@ -261,6 +261,10 @@ struct Part {
 struct Media {
     #[serde(rename = "Part", default)]
     part: Vec<Part>,
+    // Used only to decide whether to bother direct-playing; see
+    // codec_unsupported.
+    #[serde(rename = "audioCodec")]
+    audio_codec: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -299,12 +303,36 @@ struct MetadataContainer {
     play_queue_version: Option<u64>,
     #[serde(rename = "playQueueSelectedItemID")]
     play_queue_selected_item_id: Option<u64>,
+    #[serde(rename = "playQueueTotalCount")]
+    play_queue_total_count: Option<u64>,
 }
 
 #[derive(Deserialize, Debug)]
 struct MetadataResponse {
     #[serde(rename = "MediaContainer")]
     media_container: MetadataContainer,
+}
+
+// /hubs/search groups its results into one Hub per result type rather than
+// returning a flat Metadata list like the browse endpoints do.
+#[derive(Deserialize, Debug, Default)]
+struct Hub {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(rename = "Metadata", default)]
+    metadata: Vec<Metadata>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct HubsContainer {
+    #[serde(rename = "Hub", default)]
+    hub: Vec<Hub>,
+}
+
+#[derive(Deserialize, Debug)]
+struct HubsResponse {
+    #[serde(rename = "MediaContainer")]
+    media_container: HubsContainer,
 }
 
 async fn plex_get_json<T: serde::de::DeserializeOwned>(
@@ -404,6 +432,35 @@ async fn stream_url_for(
     Ok(format!("{server_url}{part_key}?X-Plex-Token={token}"))
 }
 
+// PMS hands back a 21-item window of a play queue by default, and ignores
+// `window` on the POST/PUT/DELETE that change one — only a plain GET honours
+// it. Anything longer than the window is silently missing, so a long album
+// would just stop partway. Verified against PMS 1.43.4.
+//
+// 1000 covers any album or artist while capping what a Pi has to parse; at
+// ~1.8KB an item that is a couple of MB in the worst case.
+const QUEUE_WINDOW: u32 = 1000;
+
+async fn fetch_full_queue(
+    client: &reqwest::Client,
+    server_url: &str,
+    token: &str,
+    pq_id: u64,
+) -> anyhow::Result<MetadataContainer> {
+    // Plain read — no own=1, which would claim the queue for this client and
+    // can retire the one we're playing.
+    let url =
+        format!("{server_url}/playQueues/{pq_id}?includeChapters=1&window={QUEUE_WINDOW}");
+    let r: MetadataResponse = plex_get_json(client, &url, token).await?;
+    Ok(r.media_container)
+}
+
+// A queue response is complete when it holds every item PMS says it has.
+fn is_windowed(mc: &MetadataContainer) -> bool {
+    mc.play_queue_total_count
+        .is_some_and(|total| (mc.metadata.len() as u64) < total)
+}
+
 fn redact(url: &str) -> String {
     match url.find("X-Plex-Token=") {
         Some(i) => format!("{}X-Plex-Token=…", &url[..i]),
@@ -411,24 +468,228 @@ fn redact(url: &str) -> String {
     }
 }
 
+// A body that stopped short of its Content-Length. reqwest reports it as a
+// decode error, and download_track decodes nothing else, so inside that call
+// this only ever means the transfer died partway.
+fn is_truncated_body(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<reqwest::Error>()
+        .map(|e| e.is_decode())
+        .unwrap_or(false)
+}
+
 // Downloads a track, re-resolving its part key once if the server rejects
 // it. Plex embeds a version timestamp in part keys, so a key captured when
 // the queue was built goes stale if the server re-analyzes the file.
-async fn fetch_track_bytes(
+// Codecs the Symphonia build has no decoder for at all. This is only a hint
+// that saves downloading a file we could never play — the probe after a
+// download is what actually decides, so a missing entry here costs bandwidth,
+// not correctness.
+const UNDECODABLE_CODECS: &[&str] = &[
+    "wmav1", "wmav2", "wmapro", "wmalossless", "wmavoice", "opus", "ape", "wavpack",
+    "musepack", "mpc", "tta", "shorten", "speex", "dsd_lsbf", "dsd_msbf",
+    "dsd_lsbf_planar", "dsd_msbf_planar", "ra_144", "ra_288", "atrac3", "atrac3p",
+];
+
+fn codec_unsupported(track: &Metadata) -> bool {
+    track
+        .media
+        .first()
+        .and_then(|m| m.audio_codec.as_deref())
+        .is_some_and(|c| UNDECODABLE_CODECS.contains(&c.to_ascii_lowercase().as_str()))
+}
+
+// Does Symphonia actually have a decoder for these bytes? Building the decoder
+// reads no further than the container header and codec setup, so this is cheap
+// even with a whole track resident.
+fn is_decodable(bytes: &Arc<[u8]>) -> bool {
+    make_decoder(bytes).is_ok()
+}
+
+// Transcode sessions we have opened and not yet confirmed stopped.
+//
+// PMS keeps a session alive until told otherwise — it does not close one when
+// the download finishes — and it refuses to start a new transcode while any is
+// open. So a download that never reaches its own stop call (an axum handler
+// dropped when the browser navigates away, or a start that failed after PMS had
+// already registered the session) would block every later transcode with a 400.
+//
+// This only ever holds ids we generated ourselves. Sessions carry no client
+// attribution, so stopping one we did not create could kill the phone's stream.
+static OPEN_TRANSCODES: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+fn open_transcodes() -> &'static Mutex<std::collections::HashSet<String>> {
+    OPEN_TRANSCODES.get_or_init(Default::default)
+}
+
+async fn stop_transcode(
+    client: &reqwest::Client,
+    server_url: &str,
+    token: &str,
+    session: &str,
+) {
+    let url = format!("{server_url}/video/:/transcode/universal/stop?session={session}");
+    let _ = client
+        .get(&url)
+        .header("X-Plex-Token", token)
+        .header("X-Plex-Client-Identifier", client_identifier())
+        .send()
+        .await;
+    open_transcodes().lock().unwrap().remove(session);
+}
+
+// Every transcode request carries the same identifying headers. The
+// `X-Plex-Client-Profile-Name` one is load-bearing: `X-Plex-Client-Profile-Extra`
+// only *adds* targets to a base profile, and PMS ships none for a product it has
+// never heard of, so without a recognised profile name it answers 400 "unable to
+// find a matching profile". "Generic" matches; "Chrome" and "Plexamp" do not.
+fn transcode_request(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+) -> reqwest::RequestBuilder {
+    client
+        .get(url)
+        .header("X-Plex-Token", token)
+        .header("X-Plex-Client-Identifier", client_identifier())
+        .header("X-Plex-Client-Profile-Name", "Generic")
+        .header("X-Plex-Product", PRODUCT_NAME)
+        .header("X-Plex-Version", VERSION)
+        .header("X-Plex-Device-Name", PRODUCT_NAME)
+}
+
+// Two calls, not one. PMS records a transcode *decision* against the session and
+// refuses to serve the stream to a session that lacks one — "Denying access due
+// to session lacking decision for transcode of key ...". Skipping it is not a
+// clean failure: the first transcode after a restart usually works and later
+// ones 400, and a session can be terminated mid-stream, which surfaces as a
+// track cutting out partway. Verified against PMS 1.43.4: decision-then-start
+// succeeded three times running where start alone failed on the second attempt.
+async fn transcode_exchange(
+    client: &reqwest::Client,
+    token: &str,
+    decision_url: &str,
+    start_url: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let decision = transcode_request(client, decision_url, token).send().await?;
+    if !decision.status().is_success() {
+        anyhow::bail!(
+            "transcode decision failed: {} for {}",
+            decision.status(),
+            redact(decision_url)
+        );
+    }
+    let resp = transcode_request(client, start_url, token).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!(
+            "transcode failed: {} for {}",
+            resp.status(),
+            redact(start_url)
+        );
+    }
+    Ok(resp.bytes().await?.to_vec())
+}
+
+// Ask PMS to re-encode the track to MP3, which Symphonia always decodes.
+async fn transcode_attempt(
     client: &reqwest::Client,
     server_url: &str,
     token: &str,
     track: &Metadata,
 ) -> anyhow::Result<Vec<u8>> {
-    let url = stream_url_for(client, server_url, token, track).await?;
-    match download_track(client, &url).await {
+    const BITRATE: u32 = 320;
+    let session = Uuid::new_v4().to_string();
+    open_transcodes().lock().unwrap().insert(session.clone());
+
+    let key = track
+        .key
+        .clone()
+        .unwrap_or_else(|| format!("/library/metadata/{}", track.rating_key));
+    let profile_extra = "add-transcode-target(replace=true&type=musicProfile&context=streaming&protocol=http&container=mp3&audioCodec=mp3)";
+    // The decision and the stream must agree on every parameter, session
+    // included, or the decision does not apply to the request that follows.
+    let query = format!(
+        "path={}&session={session}&X-Plex-Session-Identifier={session}&musicBitrate={BITRATE}&protocol=http&directPlay=0&directStream=0&X-Plex-Client-Identifier={}&X-Plex-Client-Profile-Extra={}",
+        urlencoding::encode(&key),
+        client_identifier(),
+        urlencoding::encode(profile_extra),
+    );
+    let decision_url = format!("{server_url}/music/:/transcode/universal/decision?{query}");
+    let start_url = format!("{server_url}/music/:/transcode/universal/start.mp3?{query}");
+
+    let out = transcode_exchange(client, token, &decision_url, &start_url).await;
+    // Stop either way: a start that failed can still have registered a session.
+    stop_transcode(client, server_url, token, &session).await;
+    out
+}
+
+async fn fetch_transcoded(
+    client: &reqwest::Client,
+    server_url: &str,
+    token: &str,
+    track: &Metadata,
+) -> anyhow::Result<Vec<u8>> {
+    match transcode_attempt(client, server_url, token, track).await {
         Ok(b) => Ok(b),
+        Err(first) => {
+            // Most likely a session we could not clean up is still holding the
+            // transcoder. Clear ours and give it one more go.
+            let stale: Vec<String> =
+                open_transcodes().lock().unwrap().iter().cloned().collect();
+            if stale.is_empty() {
+                return Err(first);
+            }
+            for session in stale {
+                stop_transcode(client, server_url, token, &session).await;
+            }
+            transcode_attempt(client, server_url, token, track).await
+        }
+    }
+}
+
+async fn fetch_track_bytes(
+    client: &reqwest::Client,
+    server_url: &str,
+    token: &str,
+    track: &Metadata,
+) -> anyhow::Result<Arc<[u8]>> {
+    // Nothing to gain from pulling down a file with no decoder behind it.
+    if codec_unsupported(track) {
+        match fetch_transcoded(client, server_url, token, track).await {
+            Ok(b) => return Ok(b.into()),
+            // Fall through and fetch the original anyway: the player will fail
+            // to decode it and move on, which beats stalling the queue on a
+            // track that can be neither played nor converted.
+            Err(e) => eprintln!("transcode failed for \"{}\": {e:#}", track.title),
+        }
+    }
+
+    let url = stream_url_for(client, server_url, token, track).await?;
+    let bytes: Arc<[u8]> = match download_track(client, &url).await {
+        Ok(b) => b.into(),
         Err(e) if e.to_string().contains("404") => {
             let fresh = fetch_item(client, server_url, token, &track.rating_key).await?;
             let url = stream_url_for(client, server_url, token, &fresh).await?;
-            download_track(client, &url).await
+            download_track(client, &url).await?.into()
         }
-        Err(e) => Err(e),
+        // The part key is fine here — the connection just dropped mid-body,
+        // which whole-track downloads are big enough to hit routinely. Same
+        // URL, one more go; a persistent fault falls through to the
+        // prefetcher's own retry interval rather than looping here.
+        Err(e) if is_truncated_body(&e) => download_track(client, &url).await?.into(),
+        Err(e) => return Err(e),
+    };
+
+    // The codec hint only knows what PMS reported. This catches damaged files
+    // and codecs it named but Symphonia still cannot open.
+    if is_decodable(&bytes) {
+        return Ok(bytes);
+    }
+    match fetch_transcoded(client, server_url, token, track).await {
+        Ok(b) => Ok(b.into()),
+        Err(e) => {
+            eprintln!("transcode failed for \"{}\": {e:#}", track.title);
+            Ok(bytes)
+        }
     }
 }
 
@@ -523,8 +784,16 @@ enum PlayerCmd {
     SkipTo(usize),
     Seek(u64),
     SetVolume(u8),
+    SetRepeat(u8),
+    SetShuffle(bool),
     Stop,
 }
+
+// Plex's repeat vocabulary. Checked against Plexamp rather than assumed:
+// 0 is off, 1 repeats the current track, 2 repeats the queue — not the
+// 1-is-all ordering that gets quoted around.
+const REPEAT_ONE: u8 = 1;
+const REPEAT_ALL: u8 = 2;
 
 #[derive(Clone, Serialize, Default)]
 struct TrackInfo {
@@ -546,6 +815,11 @@ struct PlayerStatus {
     state: String,
     position_ms: u64,
     volume: u8,
+    // 0 off, 1 this track, 2 the queue.
+    repeat: u8,
+    // Picks the next track at random from the queue instead of taking the
+    // one after this. The queue itself keeps its order.
+    shuffle: bool,
     info: QueueInfo,
     // Identifies which PlayQueue command this state belongs to, so a
     // prefetcher for an old queue knows to stop.
@@ -606,6 +880,58 @@ fn set_waiting(status: &SharedStatus, index: usize) {
 fn set_serial(status: &SharedStatus, serial: u64) {
     let mut s = status.lock().unwrap();
     s.queue_serial = serial;
+}
+
+// Separate from set_status so the repeat mode survives every ordinary status
+// update without threading it through all of them.
+fn set_repeat(status: &SharedStatus, repeat: u8) {
+    let mut s = status.lock().unwrap();
+    s.repeat = repeat;
+    s.generation += 1;
+}
+
+fn set_shuffle(status: &SharedStatus, shuffle: bool) {
+    let mut s = status.lock().unwrap();
+    s.shuffle = shuffle;
+    s.generation += 1;
+}
+
+// A random index, without pulling in a PRNG crate: uuid is already a
+// dependency and its v4 generator is backed by the OS entropy source. The
+// modulo bias is irrelevant for choosing a track.
+fn rand_below(n: usize) -> usize {
+    if n <= 1 {
+        return 0;
+    }
+    (Uuid::new_v4().as_u128() % n as u128) as usize
+}
+
+// Shuffle plays every track once before repeating any: pick at random from
+// those not yet played this pass. Returns None when the pass is done and
+// nothing should follow.
+fn next_shuffled(
+    len: usize,
+    current: usize,
+    played: &mut std::collections::HashSet<usize>,
+    repeat: u8,
+) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    if played.len() >= len {
+        if repeat != REPEAT_ALL {
+            return None;
+        }
+        played.clear();
+    }
+    // `current` is already in `played` mid-pass; the filter matters just after
+    // the reset above, where it stops the track that has only just finished
+    // from being the first pick of the new pass. A one-track queue is exempt,
+    // since there is nothing else to play.
+    let remaining: Vec<usize> = (0..len)
+        .filter(|i| !(played.contains(i) || len > 1 && *i == current))
+        .collect();
+    remaining.get(rand_below(remaining.len())).copied()
 }
 
 fn set_position(status: &SharedStatus, position_ms: u64) {
@@ -684,6 +1010,11 @@ fn spawn_player_thread(status: SharedStatus) -> std_mpsc::Sender<PlayerCmd> {
         let mut current_index: usize = 0;
         let mut paused = false;
         let mut volume: u8 = 100;
+        let mut repeat: u8 = 0;
+        let mut shuffle = false;
+        // Indices already played this shuffle pass, so every track gets a turn
+        // before any repeats. Reset whenever the queue itself changes.
+        let mut played: std::collections::HashSet<usize> = Default::default();
         let mut pending_seek_ms: u64 = 0;
 
         'outer: loop {
@@ -715,6 +1046,7 @@ fn spawn_player_thread(status: SharedStatus) -> std_mpsc::Sender<PlayerCmd> {
                         current_index = start_index;
                         pending_seek_ms = start_offset_ms;
                         paused = start_paused;
+                        played.clear();
                         set_serial(&status, serial);
                         let idx = if current_index < queue.len() {
                             Some(current_index)
@@ -736,6 +1068,7 @@ fn spawn_player_thread(status: SharedStatus) -> std_mpsc::Sender<PlayerCmd> {
                         let was_idle = idle;
                         let new_idx = merge_queue(&mut queue, current_index, tracks);
                         info = new_info;
+                        played.clear();
                         if !was_idle {
                             current_index = new_idx.unwrap_or(current_index.min(queue.len()));
                         }
@@ -751,6 +1084,15 @@ fn spawn_player_thread(status: SharedStatus) -> std_mpsc::Sender<PlayerCmd> {
                         volume = v.min(100);
                         let idx = if idle { None } else { Some(current_index) };
                         set_status(&status, &queue, idx, paused, volume, &info);
+                    }
+                    Ok(PlayerCmd::SetRepeat(r)) => {
+                        repeat = r.min(REPEAT_ALL);
+                        set_repeat(&status, repeat);
+                    }
+                    Ok(PlayerCmd::SetShuffle(on)) => {
+                        shuffle = on;
+                        played.clear();
+                        set_shuffle(&status, shuffle);
                     }
                     Ok(PlayerCmd::Stop) => {
                         queue.clear();
@@ -781,6 +1123,7 @@ fn spawn_player_thread(status: SharedStatus) -> std_mpsc::Sender<PlayerCmd> {
             }
 
             // ---- Play queue[current_index] ----
+            played.insert(current_index);
             let bytes = queue[current_index].bytes.clone().unwrap();
             set_status(&status, &queue, Some(current_index), paused, volume, &info);
 
@@ -917,6 +1260,15 @@ fn spawn_player_thread(status: SharedStatus) -> std_mpsc::Sender<PlayerCmd> {
                             volume = v.min(100);
                             set_status(&status, &queue, Some(current_index), paused, volume, &info);
                         }
+                        Ok(PlayerCmd::SetRepeat(r)) => {
+                            repeat = r.min(REPEAT_ALL);
+                            set_repeat(&status, repeat);
+                        }
+                        Ok(PlayerCmd::SetShuffle(on)) => {
+                            shuffle = on;
+                            played.clear();
+                            set_shuffle(&status, shuffle);
+                        }
                         Ok(PlayerCmd::Stop) => break 'track TrackOutcome::Stopped,
                         Ok(PlayerCmd::SetBytes(index, b)) => {
                             if let Some(t) = queue.get_mut(index) {
@@ -933,6 +1285,7 @@ fn spawn_player_thread(status: SharedStatus) -> std_mpsc::Sender<PlayerCmd> {
                             let keep = queue.get_mut(current_index).and_then(|t| t.bytes.take());
                             let new_idx = merge_queue(&mut queue, current_index, tracks);
                             info = new_info;
+                            played.clear();
                             set_serial(&status, serial);
                             match new_idx {
                                 Some(i) => {
@@ -966,6 +1319,7 @@ fn spawn_player_thread(status: SharedStatus) -> std_mpsc::Sender<PlayerCmd> {
                             current_index = start_index;
                             pending_seek_ms = start_offset_ms;
                             paused = start_paused;
+                            played.clear();
                             set_serial(&status, serial);
                             break 'track TrackOutcome::Requeued;
                         }
@@ -1016,15 +1370,43 @@ fn spawn_player_thread(status: SharedStatus) -> std_mpsc::Sender<PlayerCmd> {
                 out.discard();
             }
 
+            // Repeat-one replays this index, so its audio has to survive —
+            // otherwise the player would stall waiting for the prefetcher to
+            // fetch a track it just finished. An explicit skip still moves
+            // on: repeat-one governs what happens when a track runs out,
+            // not what the listener asked for.
+            let replaying = matches!(outcome, TrackOutcome::Ended) && repeat == REPEAT_ONE;
+
             // Free this track's audio now that it's done (or abandoned).
             if let Some(t) = queue.get_mut(current_index) {
-                if !matches!(outcome, TrackOutcome::Requeued) {
+                if !matches!(outcome, TrackOutcome::Requeued) && !replaying {
                     t.bytes = None;
                 }
             }
 
             match outcome {
-                TrackOutcome::Ended | TrackOutcome::Next => current_index += 1,
+                TrackOutcome::Ended if replaying => pending_seek_ms = 0,
+                TrackOutcome::Ended | TrackOutcome::Next => {
+                    if shuffle {
+                        // Any track in the queue, not the one that happens to
+                        // sit next in it. queue.len() parks the player on the
+                        // idle path, the same as running off the end.
+                        current_index = next_shuffled(
+                            queue.len(),
+                            current_index,
+                            &mut played,
+                            repeat,
+                        )
+                        .unwrap_or(queue.len());
+                    } else {
+                        current_index += 1;
+                        // Repeat-all wraps rather than falling off the end.
+                        if repeat == REPEAT_ALL && !queue.is_empty() && current_index >= queue.len()
+                        {
+                            current_index = 0;
+                        }
+                    }
+                }
                 TrackOutcome::Previous => current_index = current_index.saturating_sub(1),
                 TrackOutcome::JumpTo(i) => current_index = i,
                 TrackOutcome::Stopped => {
@@ -1132,6 +1514,38 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
   .empty { color: var(--muted); padding: 40px 0; text-align: center; }
 
+  /* Artwork placeholder, for items the library has no image for */
+  .ph { display: grid; place-items: center; background: var(--panel-2); color: #4a4a52; }
+  .art.ph { font-size: 38px; }
+  .hero .ph {
+    width: 180px; height: 180px; border-radius: var(--radius); font-size: 56px;
+    box-shadow: 0 12px 40px rgba(0,0,0,.6); flex: none;
+  }
+  .qi .ph { width: 40px; height: 40px; border-radius: 4px; font-size: 18px; }
+
+  /* Section view switcher */
+  .viewbar { display: flex; align-items: center; gap: 10px; margin: 6px 0 18px; }
+  .tabs { display: flex; gap: 6px; }
+  .tab {
+    background: var(--panel-2); color: var(--muted); border: 0; border-radius: 999px;
+    padding: 7px 14px; font-size: 13px; cursor: pointer;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.on { background: var(--accent); color: #111; font-weight: 700; }
+  .viewbar .btn { margin-left: auto; }
+
+  /* Search */
+  #q {
+    margin-left: auto; flex: none; width: 240px; max-width: 40vw;
+    background: var(--panel-2); border: 1px solid #2a2a2e; color: var(--text);
+    border-radius: 999px; padding: 8px 14px; font-size: 14px; outline: none;
+  }
+  #q:focus { border-color: var(--accent); }
+  #q::placeholder { color: var(--muted); }
+  h2.sec { font-size: 15px; color: var(--muted); font-weight: 600; margin: 24px 0 10px; }
+  h2.sec:first-child { margin-top: 4px; }
+  .tracks .sub2 { color: var(--muted); font-weight: 400; }
+
   /* Now playing bar */
   #np {
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
@@ -1222,6 +1636,9 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <header>
   <div class="wordmark">Rust<span>Amp</span></div>
   <nav id="crumbs"></nav>
+  <input id="q" type="search" placeholder="Search" autocomplete="off" spellcheck="false"
+         oninput="onSearchInput(this.value)"
+         onkeydown="if(event.key==='Escape'){this.value='';onSearchInput('')}">
 </header>
 
 <main>
@@ -1244,6 +1661,9 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
   </div>
   <div class="center">
     <div class="ctl">
+      <button class="ib" id="sh-btn" onclick="toggleShuffle()" title="Shuffle">
+        <svg viewBox="0 0 24 24"><path d="M17 3l4 4-4 4V8h-2.2l-2.3 3.2 2.3 3.2H17v-3l4 4-4 4v-3h-3.2l-2.6-3.6L8.6 16H3v-2h4.6l2.6-3.6L7.6 8H3V6h5.6l2.6 3.6L13.8 6H17V3z"/></svg>
+      </button>
       <button class="ib" onclick="post('/api/prev')" title="Previous">
         <svg viewBox="0 0 24 24"><path d="M6 6h2v12H6zm3.5 6 8.5 6V6z"/></svg>
       </button>
@@ -1253,6 +1673,10 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       </button>
       <button class="ib" onclick="post('/api/skip')" title="Next">
         <svg viewBox="0 0 24 24"><path d="M16 6h2v12h-2zM6 18l8.5-6L6 6z"/></svg>
+      </button>
+      <button class="ib" id="rp-btn" onclick="cycleRepeat()" title="Repeat">
+        <svg id="ic-rp" viewBox="0 0 24 24"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/></svg>
+        <svg id="ic-rp1" viewBox="0 0 24 24" style="display:none"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4zm-5-6h-1.5l-2 1v1.5l1.5-.7V16h2v-5z"/></svg>
       </button>
       <button class="ib" id="qbtn" onclick="toggleQueue()" title="Queue">
         <svg viewBox="0 0 24 24"><path d="M3 6h12v2H3zm0 5h12v2H3zm0 5h8v2H3zm14-6v6.3a2.5 2.5 0 1 0 2 2.45V12h3v-2h-5z"/></svg>
@@ -1291,12 +1715,28 @@ function pumpArt() {
     if (!img.isConnected) continue;
     artActive++;
     const done = () => { artActive--; pumpArt(); };
-    img.onload = done; img.onerror = done;
+    img.onload = done;
+    // A thumb the server no longer has would otherwise stay a broken icon.
+    img.onerror = () => {
+      const ph = document.createElement("div");
+      ph.className = `${img.className} ph`;
+      ph.innerHTML = "&#9835;";
+      img.replaceWith(ph);
+      done();
+    };
     img.src = img.dataset.src;
   }
 }
 function lazyArt(root) {
   root.querySelectorAll("img[data-src]").forEach(img => artObserver.observe(img));
+}
+// An <img> whose src resolves to nothing draws the browser's broken-image
+// icon, so anything the library has no artwork for gets a placeholder tile.
+function art(path, size, cls, lazy) {
+  const c = cls || "";
+  if (!path) return `<div class="${c} ph">&#9835;</div>`;
+  const src = thumb(path, size);
+  return lazy ? `<img class="${c}" data-src="${src}">` : `<img class="${c}" src="${src}">`;
 }
 const fmt = ms => { const s = Math.floor((ms||0)/1000); return `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`; };
 const post = async (url) => {
@@ -1350,28 +1790,93 @@ async function showSections() {
   swap(g);
 }
 
-async function showSection(key) {
-  const my = navId;
+// Which of the three ways into the library is showing. Kept outside the
+// function so the breadcrumb returns you to the view you were in.
+let sectionView = "artists";
+
+async function showSection(key, view) {
+  if (view) sectionView = view;
+  const my = ++navId;
   setHero("");
-  const items = (await (await fetch(`/api/sections/${key}`)).json()).MediaContainer.Metadata || [];
+  const load = { artists: sectionArtists, albums: sectionAlbums, songs: sectionSongs }[sectionView];
+  let body;
+  try { body = await load(key); } catch (e) { return toast(String(e)); }
   if (stale(my)) return;
+
+  const bar = el(`<div class="viewbar"><div class="tabs">
+      <button class="tab" data-v="artists">Artists</button>
+      <button class="tab" data-v="albums">Albums</button>
+      <button class="tab" data-v="songs">Songs</button>
+    </div><button class="btn ghost">Shuffle everything</button></div>`);
+  bar.querySelectorAll(".tab").forEach(b => {
+    b.classList.toggle("on", b.dataset.v === sectionView);
+    b.onclick = () => showSection(key, b.dataset.v);
+  });
+  bar.querySelector(".btn").onclick = () => post(`/api/shuffle-library/${key}`);
+
+  const box = document.createElement("div");
+  box.appendChild(bar); box.appendChild(body);
+  swap(box);
+  markNow();
+}
+
+async function sectionArtists(key) {
+  const items = (await (await fetch(`/api/sections/${key}`)).json()).MediaContainer.Metadata || [];
   const g = document.createElement("div"); g.className = "grid";
   items.forEach(a => {
-    const card = el(`<div class="card round"><img class="art" data-src="${thumb(a.thumb, 300)}"><div class="t">${esc(a.title)}</div><div class="s">${esc(a.type)}</div></div>`);
+    const card = el(`<div class="card round">${art(a.thumb, 300, "art", true)}<div class="t">${esc(a.title)}</div><div class="s">${esc(a.type)}</div></div>`);
     card.onclick = () => go(a.title, () => showArtist(a));
     g.appendChild(card);
   });
-  swap(g);
+  return g;
+}
+
+async function sectionAlbums(key) {
+  const items = (await (await fetch(`/api/sections/${key}/albums`)).json()).MediaContainer.Metadata || [];
+  const g = document.createElement("div"); g.className = "grid";
+  items.forEach(al => {
+    const card = el(`<div class="card">${art(al.thumb, 300, "art", true)}<div class="t">${esc(al.title)}</div><div class="s">${esc(al.parentTitle || "")}</div></div>`);
+    card.onclick = () => go(al.title, () => showAlbum(al));
+    g.appendChild(card);
+  });
+  return g;
+}
+
+async function sectionSongs(key) {
+  const items = (await (await fetch(`/api/sections/${key}/tracks`)).json()).MediaContainer.Metadata || [];
+  const ul = document.createElement("ul"); ul.className = "tracks";
+  items.forEach(t => {
+    const li = el(`<li data-rk="${t.ratingKey}"><span class="n">&#9834;</span>
+      <span class="t">${esc(t.title)}<span class="sub2"> &mdash; ${esc(t.grandparentTitle || "")}</span></span>
+      <span class="acts">
+        <button class="mini" data-act="next" title="Play next">Next</button>
+        <button class="mini" data-act="add" title="Add to queue">+</button>
+      </span><span class="d">${fmt(t.duration)}</span></li>`);
+    li.onclick = (e) => {
+      const act = e.target.dataset && e.target.dataset.act;
+      if (act === "next") { e.stopPropagation(); return post(`/api/queue/add?rating_key=${t.ratingKey}&next=1`); }
+      if (act === "add")  { e.stopPropagation(); return post(`/api/queue/add?rating_key=${t.ratingKey}`); }
+      post(`/api/play/${t.ratingKey}`);
+    };
+    ul.appendChild(li);
+  });
+  return ul;
 }
 
 async function showArtist(artist) {
   const my = navId;
-  setHero(`<div class="hero"><img src="${thumb(artist.thumb, 400)}"><div><div class="sub">Artist</div><h1>${esc(artist.title)}</h1></div></div>`);
+  // An artist rating key seeds a play queue just like an album one does.
+  setHero(`<div class="hero">${art(artist.thumb, 400, "", false)}<div>
+    <div class="sub">Artist</div><h1>${esc(artist.title)}</h1>
+    <div class="actions">
+      <button class="btn" onclick="post('/api/play-album/${artist.ratingKey}')">&#9654; Play all</button>
+      <button class="btn ghost" onclick="post('/api/play-album/${artist.ratingKey}?shuffle=1')">Shuffle</button>
+    </div></div></div>`);
   const albums = (await (await fetch(`/api/browse/${artist.ratingKey}`)).json()).MediaContainer.Metadata || [];
   if (stale(my)) return;
   const g = document.createElement("div"); g.className = "grid";
   albums.forEach(al => {
-    const card = el(`<div class="card"><img class="art" data-src="${thumb(al.thumb, 300)}"><div class="t">${esc(al.title)}</div><div class="s">${al.year || ""}</div></div>`);
+    const card = el(`<div class="card">${art(al.thumb, 300, "art", true)}<div class="t">${esc(al.title)}</div><div class="s">${al.year || ""}</div></div>`);
     card.onclick = () => go(al.title, () => showAlbum(al));
     g.appendChild(card);
   });
@@ -1381,11 +1886,12 @@ async function showArtist(artist) {
 async function showAlbum(album) {
   const my = navId;
   currentAlbumKey = album.ratingKey;
-  setHero(`<div class="hero"><img src="${thumb(album.thumb, 400)}"><div>
+  setHero(`<div class="hero">${art(album.thumb, 400, "", false)}<div>
     <div class="sub">${esc(album.parentTitle || "")}</div><h1>${esc(album.title)}</h1>
     <div class="sub">${album.year || ""}</div>
     <div class="actions">
       <button class="btn" onclick="post('/api/play-album/${album.ratingKey}')">▶ Play</button>
+      <button class="btn ghost" onclick="post('/api/play-album/${album.ratingKey}?shuffle=1')">Shuffle</button>
       <button class="btn ghost" onclick="post('/api/queue/add?rating_key=${album.ratingKey}&next=1')">Play next</button>
       <button class="btn ghost" onclick="post('/api/queue/add?rating_key=${album.ratingKey}')">Add to queue</button>
     </div>
@@ -1418,6 +1924,87 @@ function markNow() {
   document.querySelectorAll(".tracks li").forEach(li => li.classList.toggle("now", li.dataset.rk === nowRatingKey));
 }
 
+// ---- search ----
+let searchTimer, lastQuery = "", searching = false;
+
+function onSearchInput(v) {
+  clearTimeout(searchTimer);
+  const q = v.trim();
+  searchTimer = setTimeout(() => {
+    if (q === lastQuery) return;
+    lastQuery = q;
+    // One character matches most of a library; wait for a second one.
+    if (q.length < 2) {
+      // Only pull the view back to the library if search is what put us here.
+      if (searching) { searching = false; path = []; go("Library", showSections); }
+      return;
+    }
+    searching = true;
+    showSearch(q);
+  }, 250);
+}
+
+async function showSearch(q) {
+  // Replace the crumb stack rather than pushing, so typing doesn't leave a
+  // trail of one crumb per keystroke. Picking a result still pushes onto it.
+  path = [
+    { label: "Library", load: () => { $("q").value = ""; lastQuery = ""; searching = false; return showSections(); } },
+    { label: `Search "${q}"`, load: () => showSearch(q) },
+  ];
+  renderCrumbs();
+  const my = ++navId;
+  setHero("");
+  let r;
+  try {
+    r = await (await fetch(`/api/search?q=${encodeURIComponent(q)}`)).json();
+  } catch (e) { return toast(String(e)); }
+  if (stale(my)) return;
+
+  const box = document.createElement("div");
+  const section = (label, node) => {
+    const h = document.createElement("h2");
+    h.className = "sec"; h.textContent = label;
+    box.appendChild(h); box.appendChild(node);
+  };
+  const cards = (items, round, pick) => {
+    const g = document.createElement("div"); g.className = "grid";
+    items.forEach(a => {
+      const sub = round ? "Artist" : esc(a.parentTitle || "") || (a.year || "");
+      const card = el(`<div class="card${round ? " round" : ""}">${art(a.thumb, 300, "art", true)}<div class="t">${esc(a.title)}</div><div class="s">${sub}</div></div>`);
+      card.onclick = () => pick(a);
+      g.appendChild(card);
+    });
+    return g;
+  };
+
+  if (r.artists.length) section("Artists", cards(r.artists, true, a => go(a.title, () => showArtist(a))));
+  if (r.albums.length) section("Albums", cards(r.albums, false, al => go(al.title, () => showAlbum(al))));
+  if (r.tracks.length) {
+    const ul = document.createElement("ul"); ul.className = "tracks";
+    r.tracks.forEach(t => {
+      const li = el(`<li data-rk="${t.ratingKey}"><span class="n">♪</span>
+        <span class="t">${esc(t.title)}<span class="sub2"> — ${esc(t.grandparentTitle || "")}</span></span>
+        <span class="acts">
+          <button class="mini" data-act="next" title="Play next">Next</button>
+          <button class="mini" data-act="add" title="Add to queue">+</button>
+        </span><span class="d">${fmt(t.duration)}</span></li>`);
+      li.onclick = (e) => {
+        const act = e.target.dataset && e.target.dataset.act;
+        if (act === "next") { e.stopPropagation(); return post(`/api/queue/add?rating_key=${t.ratingKey}&next=1`); }
+        if (act === "add")  { e.stopPropagation(); return post(`/api/queue/add?rating_key=${t.ratingKey}`); }
+        // A track rating key makes a one-item play queue server-side, the
+        // same route album playback takes.
+        post(`/api/play/${t.ratingKey}`);
+      };
+      ul.appendChild(li);
+    });
+    section("Tracks", ul);
+  }
+  if (!box.childNodes.length) box.innerHTML = `<div class="empty">No results for "${esc(q)}"</div>`;
+  swap(box);
+  markNow();
+}
+
 // ---- queue drawer ----
 let queueOpen = false, lastQueueSig = "";
 function toggleQueue() {
@@ -1435,7 +2022,7 @@ function renderQueue() {
   if (!last.queue.length) { box.innerHTML = '<div class="empty">Queue is empty</div>'; return; }
   last.queue.forEach((t, i) => {
     const row = el(`<div class="qi ${i === last.current_index ? "now" : ""}">
-      <img data-src="${thumb(t.thumb, 80)}">
+      ${art(t.thumb, 80, "", true)}
       <div style="min-width:0"><div class="t">${esc(t.title)}</div><div class="a">${esc(t.artist || "")}</div></div>
       <button class="x" title="Remove">×</button></div>`);
     row.onclick = () => post(`/api/skipto?i=${i}`);
@@ -1460,6 +2047,18 @@ function seekClick(e) {
   post(`/api/seek?ms=${Math.floor(frac * dur)}`);
 }
 function setVol(v) { post(`/api/volume?v=${v}`); }
+
+// Reads back from status rather than tracking it here — the phone can
+// change it too.
+function toggleShuffle() {
+  if (!last) return;
+  post(`/api/shuffle?v=${last.shuffle ? 0 : 1}`);
+}
+// off -> whole queue -> this track -> off
+function cycleRepeat() {
+  if (!last) return;
+  post(`/api/repeat?v=${({ 0: 2, 2: 1, 1: 0 })[last.repeat || 0]}`);
+}
 
 function paint() {
   if (!last) return;
@@ -1486,6 +2085,11 @@ function paint() {
   $("np-pos").textContent = fmt(pos);
   $("np-dur").textContent = fmt(dur);
   $("np-fill").style.width = dur ? `${(pos / dur) * 100}%` : "0%";
+  const rp = last.repeat || 0;
+  $("rp-btn").classList.toggle("on", rp !== 0);
+  $("ic-rp").style.display = rp === 1 ? "none" : "";
+  $("ic-rp1").style.display = rp === 1 ? "" : "none";
+  $("sh-btn").classList.toggle("on", !!last.shuffle);
   const rk = t ? t.rating_key : null;
   if (rk !== nowRatingKey) { nowRatingKey = rk; markNow(); }
 }
@@ -1617,6 +2221,16 @@ impl AppState {
             play_queue_version: None,
         }
     }
+
+}
+
+// Everything PMS tells us about a queue it just handed back.
+fn queue_info_from(state: &AppState, mc: &MetadataContainer) -> QueueInfo {
+    let mut info = state.local_queue_info();
+    info.play_queue_id = mc.play_queue_id;
+    info.play_queue_version = mc.play_queue_version;
+    info.container_key = mc.play_queue_id.map(|id| format!("/playQueues/{id}"));
+    info
 }
 
 // "http://192.168.1.50:32400" -> ("http", "192.168.1.50", 32400)
@@ -1657,15 +2271,35 @@ async fn create_play_queue(
     state: &AppState,
     rating_key: &str,
     start_track_key: Option<&str>,
+    shuffle: bool,
 ) -> anyhow::Result<(Vec<Metadata>, usize, QueueInfo)> {
     let uri = format!(
         "server://{}/com.plexapp.plugins.library/library/metadata/{}",
         state.server_machine_id, rating_key
     );
+    create_play_queue_uri(state, &uri, start_track_key, shuffle).await
+}
+
+// A whole library section as a queue source, rather than one item. The same
+// endpoint takes either; only the uri differs.
+fn section_uri(state: &AppState, section_key: &str) -> String {
+    format!(
+        "server://{}/com.plexapp.plugins.library/library/sections/{}/all",
+        state.server_machine_id, section_key
+    )
+}
+
+async fn create_play_queue_uri(
+    state: &AppState,
+    uri: &str,
+    start_track_key: Option<&str>,
+    shuffle: bool,
+) -> anyhow::Result<(Vec<Metadata>, usize, QueueInfo)> {
     let mut url = format!(
-        "{}/playQueues?type=audio&uri={}&continuous=0&repeat=0&shuffle=0&includeChapters=1&own=1",
+        "{}/playQueues?type=audio&uri={}&continuous=0&repeat=0&shuffle={}&includeChapters=1&own=1",
         state.server_url,
-        urlencoding::encode(&uri)
+        urlencoding::encode(uri),
+        u8::from(shuffle)
     );
     if let Some(k) = start_track_key {
         url.push_str(&format!("&key={}", urlencoding::encode(k)));
@@ -1678,7 +2312,13 @@ async fn create_play_queue(
         anyhow::bail!("create play queue failed: {status} — {body}");
     }
     let r: MetadataResponse = resp.json().await?;
-    let mc = r.media_container;
+    let mut mc = r.media_container;
+    // The POST answers with a window, not the queue.
+    if is_windowed(&mc) {
+        if let Some(id) = mc.play_queue_id {
+            mc = fetch_full_queue(&state.client, &state.server_url, &state.token, id).await?;
+        }
+    }
     let start = mc
         .metadata
         .iter()
@@ -1687,10 +2327,7 @@ async fn create_play_queue(
                 && m.play_queue_item_id == mc.play_queue_selected_item_id
         })
         .unwrap_or(0);
-    let mut info = state.local_queue_info();
-    info.play_queue_id = mc.play_queue_id;
-    info.play_queue_version = mc.play_queue_version;
-    info.container_key = mc.play_queue_id.map(|id| format!("/playQueues/{id}"));
+    let info = queue_info_from(state, &mc);
     Ok((mc.metadata, start, info))
 }
 
@@ -1715,9 +2352,7 @@ async fn start_queue(
     *state.queue_source.lock().unwrap() = (server_url.clone(), token.clone());
 
     let first_bytes: Arc<[u8]> =
-        fetch_track_bytes(&state.client, &server_url, &token, &tracks[start_index])
-            .await?
-            .into();
+        fetch_track_bytes(&state.client, &server_url, &token, &tracks[start_index]).await?;
 
     let mut queued: Vec<QueuedTrack> = tracks.iter().map(to_queued).collect();
     queued[start_index].bytes = Some(first_bytes);
@@ -1752,7 +2387,8 @@ fn spawn_prefetcher(
     let player_tx = state.player_tx.clone();
     let status = state.status.clone();
     tokio::spawn(async move {
-        let mut last_sent: std::collections::HashMap<usize, std::time::Instant> =
+        // When each index was last *attempted*, successfully or not.
+        let mut last_try: std::collections::HashMap<usize, std::time::Instant> =
             Default::default();
         loop {
             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1764,23 +2400,28 @@ fn spawn_prefetcher(
                 return;
             }
             let Some(cur) = cur else { return }; // stopped
+            // No index is retried more often than this, whether the last
+            // attempt succeeded or failed. Gating on success alone let a
+            // failing fetch retry on every tick — three times a second, with
+            // a log line each — for the rest of the current track.
+            const RETRY_AFTER: Duration = Duration::from_secs(5);
+            let now = std::time::Instant::now();
+            let due = |last: Option<&std::time::Instant>| {
+                last.map(|t| now.duration_since(*t) > RETRY_AFTER)
+                    .unwrap_or(true)
+            };
             let mut wanted: Vec<usize> = Vec::new();
             if let Some(w) = waiting {
                 // The player is stalled on `w`. Refetch it, but not more
-                // often than every few seconds — if it's already been sent
-                // and the player just hasn't consumed it yet, hammering PMS
-                // only makes things worse.
-                let now = std::time::Instant::now();
-                let due = last_sent
-                    .get(&w)
-                    .map(|t| now.duration_since(*t) > Duration::from_secs(5))
-                    .unwrap_or(true);
-                if due {
+                // often than that — if it's already been sent and the player
+                // just hasn't consumed it yet, hammering PMS only makes
+                // things worse.
+                if due(last_try.get(&w)) {
                     wanted.push(w);
                     fetched.remove(&w);
                 }
             }
-            if cur + 1 < tracks.len() {
+            if cur + 1 < tracks.len() && due(last_try.get(&(cur + 1))) {
                 wanted.push(cur + 1);
             }
             for idx in wanted {
@@ -1788,13 +2429,16 @@ fn spawn_prefetcher(
                     continue;
                 }
                 let track = &tracks[idx];
+                last_try.insert(idx, std::time::Instant::now());
                 match fetch_track_bytes(&client, &server_url, &token, track).await {
                     Ok(bytes) => {
-                        let _ = player_tx.send(PlayerCmd::SetBytes(idx, bytes.into()));
+                        let _ = player_tx.send(PlayerCmd::SetBytes(idx, bytes));
                         fetched.insert(idx);
-                        last_sent.insert(idx, std::time::Instant::now());
                     }
-                    Err(e) => eprintln!("prefetch failed for \"{}\": {e}", track.title),
+                    // {e:#} for anyhow's source chain: a truncated body and a
+                    // JSON parse failure both print as "error decoding
+                    // response body" on their own.
+                    Err(e) => eprintln!("prefetch failed for \"{}\": {e:#}", track.title),
                 }
             }
         }
@@ -1980,10 +2624,7 @@ fn spawn_timeline_reporter(state: &AppState) {
 // player and restarts prefetching for the new track order.
 fn apply_queue_edit(state: &AppState, mc: MetadataContainer) {
     let serial = state.next_serial();
-    let mut info = state.local_queue_info();
-    info.play_queue_id = mc.play_queue_id;
-    info.play_queue_version = mc.play_queue_version;
-    info.container_key = mc.play_queue_id.map(|id| format!("/playQueues/{id}"));
+    let info = queue_info_from(state, &mc);
     let (src_url, src_token) = state.queue_source.lock().unwrap().clone();
     let queued: Vec<QueuedTrack> = mc.metadata.iter().map(to_queued).collect();
     let _ = state.player_tx.send(PlayerCmd::ReplaceQueue {
@@ -2011,6 +2652,7 @@ async fn queue_request(
     Ok(r.media_container)
 }
 
+
 // POST /api/queue/add?rating_key=X[&next=1] — add an album/track to the
 // current queue (or start a new one if nothing is queued).
 async fn queue_add_handler(
@@ -2025,7 +2667,7 @@ async fn queue_add_handler(
 
     let Some(pq_id) = pq_id else {
         // Nothing queued yet: create and play.
-        return match create_play_queue(&state, rk, None).await {
+        return match create_play_queue(&state, rk, None, false).await {
             Ok((tracks, start, info)) => match start_queue(
                 &state,
                 state.server_url.clone(),
@@ -2056,10 +2698,7 @@ async fn queue_add_handler(
         if next { "&next=1" } else { "" }
     );
     match queue_request(&state, reqwest::Method::PUT, &url).await {
-        Ok(mc) => {
-            apply_queue_edit(&state, mc);
-            StatusCode::OK.into_response()
-        }
+        Ok(mc) => apply_edit_response(&state, mc).await,
         Err(e) => err_response(e),
     }
 }
@@ -2079,12 +2718,29 @@ async fn queue_remove_handler(
     let queue_server = state.queue_source.lock().unwrap().0.clone();
     let url = format!("{queue_server}/playQueues/{pq_id}/items/{item}?includeChapters=1&own=1");
     match queue_request(&state, reqwest::Method::DELETE, &url).await {
-        Ok(mc) => {
-            apply_queue_edit(&state, mc);
-            StatusCode::OK.into_response()
-        }
+        Ok(mc) => apply_edit_response(&state, mc).await,
         Err(e) => err_response(e),
     }
+}
+
+// A queue edit answers with a window rather than the queue, so read the whole
+// thing back before handing it to the player.
+async fn apply_edit_response(
+    state: &AppState,
+    mc: MetadataContainer,
+) -> axum::response::Response {
+    let mc = match mc.play_queue_id.filter(|_| is_windowed(&mc)) {
+        Some(id) => {
+            let (server_url, token) = state.queue_source.lock().unwrap().clone();
+            match fetch_full_queue(&state.client, &server_url, &token, id).await {
+                Ok(full) => full,
+                Err(e) => return err_response(e),
+            }
+        }
+        None => mc,
+    };
+    apply_queue_edit(state, mc);
+    StatusCode::OK.into_response()
 }
 
 fn err_response(e: anyhow::Error) -> axum::response::Response {
@@ -2117,6 +2773,35 @@ async fn section_items_handler(
     cached_listing(&state, &format!("/library/sections/{section_key}/all")).await
 }
 
+// Flat listings across the whole section, sorted by title, for browsing by
+// album name or song title rather than drilling through artists.
+//
+// sort=title, not titleSort: the latter is what Plex's own UIs use but it comes
+// back in an order that is not alphabetical by anything we display, which looks
+// broken in a flat A-Z list. excludeFields=summary halves the album payload;
+// tracks carry no summaries so it changes nothing there.
+async fn section_albums_handler(
+    State(state): State<AppState>,
+    Path(section_key): Path<String>,
+) -> axum::response::Response {
+    cached_listing(
+        &state,
+        &format!("/library/sections/{section_key}/all?type=9&sort=title&excludeFields=summary"),
+    )
+    .await
+}
+
+async fn section_tracks_handler(
+    State(state): State<AppState>,
+    Path(section_key): Path<String>,
+) -> axum::response::Response {
+    cached_listing(
+        &state,
+        &format!("/library/sections/{section_key}/all?type=10&sort=title"),
+    )
+    .await
+}
+
 async fn browse_handler(
     State(state): State<AppState>,
     Path(rating_key): Path<String>,
@@ -2124,11 +2809,58 @@ async fn browse_handler(
     cached_listing(&state, &format!("/library/metadata/{rating_key}/children")).await
 }
 
+// Grouped the way the UI renders it, so the browser doesn't have to walk
+// the Hub structure itself.
+#[derive(Serialize, Default)]
+struct SearchResults {
+    artists: Vec<Metadata>,
+    albums: Vec<Metadata>,
+    tracks: Vec<Metadata>,
+}
+
+// GET /api/search?q= — deliberately not run through ListingCache: every
+// keystroke is a distinct query, and 200 of them would evict the browse
+// listings that cache exists to keep off the Pi's network path.
+async fn search_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<Params>,
+) -> axum::response::Response {
+    let q = params.get("q").map(|s| s.trim()).unwrap_or("");
+    if q.is_empty() {
+        return Json(SearchResults::default()).into_response();
+    }
+    // excludeFields=summary drops the long description blobs we never show.
+    // Collections are left out because the UI has nowhere to put them.
+    let url = format!(
+        "{}/hubs/search?query={}&excludeFields=summary&limit=24&includeCollections=0",
+        state.server_url,
+        urlencoding::encode(q)
+    );
+    let r: HubsResponse = match plex_get_json(&state.client, &url, &state.token).await {
+        Ok(r) => r,
+        Err(e) => return err_response(e),
+    };
+    let mut out = SearchResults::default();
+    for hub in r.media_container.hub {
+        // An unscoped search covers every library on the server, so hubs for
+        // movies, shows and the rest come back too; keep the three the
+        // player can actually do something with.
+        let bucket = match hub.kind.as_str() {
+            "artist" => &mut out.artists,
+            "album" => &mut out.albums,
+            "track" => &mut out.tracks,
+            _ => continue,
+        };
+        bucket.extend(hub.metadata);
+    }
+    Json(out).into_response()
+}
+
 async fn play_handler(
     State(state): State<AppState>,
     Path(rating_key): Path<String>,
 ) -> impl IntoResponse {
-    let (tracks, start, info) = match create_play_queue(&state, &rating_key, None).await {
+    let (tracks, start, info) = match create_play_queue(&state, &rating_key, None, false).await {
         Ok(v) => v,
         Err(e) => return err_response(e),
     };
@@ -2154,10 +2886,22 @@ async fn play_album_handler(
     Path(rating_key): Path<String>,
     axum::extract::Query(params): axum::extract::Query<Params>,
 ) -> impl IntoResponse {
+    // Shuffle play: a one-off shuffled queue built by the server, distinct
+    // from shuffle mode. The order is baked into the queue, so the phone and
+    // the web UI both see exactly what will play, and it starts from the top
+    // rather than from any particular track.
+    let shuffle = params.get("shuffle").map(|v| v == "1").unwrap_or(false);
+    if shuffle {
+        // Leaving shuffle mode on as well would re-randomise a queue that is
+        // already in the order the listener asked for.
+        let _ = state.player_tx.send(PlayerCmd::SetShuffle(false));
+    }
+
     // `start` is an index into the album's track list; the play queue API
-    // wants the starting track's key instead, so resolve it first.
+    // wants the starting track's key instead, so resolve it first. A shuffled
+    // queue has no meaningful starting track.
     let start_key = match params.get("start").and_then(|v| v.parse::<usize>().ok()) {
-        Some(i) if i > 0 => {
+        Some(i) if i > 0 && !shuffle => {
             match fetch_children(&state.client, &state.server_url, &state.token, &rating_key).await
             {
                 Ok(t) => t.get(i).and_then(|m| m.key.clone()),
@@ -2167,7 +2911,7 @@ async fn play_album_handler(
         _ => None,
     };
     let (tracks, start, info) =
-        match create_play_queue(&state, &rating_key, start_key.as_deref()).await {
+        match create_play_queue(&state, &rating_key, start_key.as_deref(), shuffle).await {
             Ok(v) => v,
             Err(e) => return err_response(e),
         };
@@ -2234,6 +2978,57 @@ async fn skipto_handler(
         Some(i) => send_cmd(&state, PlayerCmd::SkipTo(i)),
         None => StatusCode::BAD_REQUEST,
     }
+}
+
+// POST /api/shuffle-library/:section_key — a shuffled queue of everything in
+// the library, the same one-off shuffled queue an album's Shuffle button makes,
+// just seeded from the whole section.
+async fn shuffle_library_handler(
+    State(state): State<AppState>,
+    Path(section_key): Path<String>,
+) -> axum::response::Response {
+    // The queue is already in the order the listener asked for; shuffle mode on
+    // top of it would only re-randomise it.
+    let _ = state.player_tx.send(PlayerCmd::SetShuffle(false));
+    let uri = section_uri(&state, &section_key);
+    let (tracks, start, info) = match create_play_queue_uri(&state, &uri, None, true).await {
+        Ok(v) => v,
+        Err(e) => return err_response(e),
+    };
+    match start_queue(
+        &state,
+        state.server_url.clone(),
+        state.token.clone(),
+        tracks,
+        start,
+        0,
+        info,
+        false,
+    )
+    .await
+    {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => err_response(e),
+    }
+}
+
+// POST /api/repeat?v=0|1|2 — off, this track, the queue.
+async fn repeat_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<Params>,
+) -> StatusCode {
+    let v = params.get("v").and_then(|v| v.parse().ok()).unwrap_or(0);
+    send_cmd(&state, PlayerCmd::SetRepeat(v))
+}
+
+// POST /api/shuffle?v=0|1 — a playback mode, not a queue edit: the queue
+// keeps its order and the player picks from it at random.
+async fn shuffle_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<Params>,
+) -> StatusCode {
+    let on = params.get("v").map(|v| v == "1").unwrap_or(false);
+    send_cmd(&state, PlayerCmd::SetShuffle(on))
 }
 
 #[derive(Serialize)]
@@ -2384,13 +3179,17 @@ fn build_timeline_xml(status: &PlayerStatus, command_id: &str) -> String {
         ("itemType", "music".to_string()),
         ("state", status.state.clone()),
         ("volume", status.volume.to_string()),
-        ("shuffle", "0".to_string()),
-        ("repeat", "0".to_string()),
+        (
+            "shuffle",
+            if status.shuffle { "1" } else { "0" }.to_string(),
+        ),
+        ("repeat", status.repeat.to_string()),
     ];
 
     let mut controllable = vec![
         "volume",
         "repeat",
+        "shuffle",
         "skipPrevious",
         "seekTo",
         "stepBack",
@@ -2516,7 +3315,9 @@ async fn play_media_handler(
         Some(ck) if ck.contains("/playQueues/") => {
             // Strip any existing query, then ask for the whole queue.
             let base = ck.split('?').next().unwrap_or(ck);
-            let url = format!("{server_url}{base}?own=1&includeChapters=1&includeRelated=0");
+            let url = format!(
+                "{server_url}{base}?own=1&includeChapters=1&includeRelated=0&window={QUEUE_WINDOW}"
+            );
             let r: MetadataResponse =
                 match plex_get_json(&state.client, &url, &token).await {
                     Ok(r) => r,
@@ -2622,6 +3423,12 @@ async fn playback_cmd_handler(
             if let Some(v) = params.get("volume").and_then(|v| v.parse::<u8>().ok()) {
                 let _ = state.player_tx.send(PlayerCmd::SetVolume(v));
             }
+            if let Some(r) = params.get("repeat").and_then(|v| v.parse::<u8>().ok()) {
+                let _ = state.player_tx.send(PlayerCmd::SetRepeat(r));
+            }
+            if let Some(s) = params.get("shuffle") {
+                let _ = state.player_tx.send(PlayerCmd::SetShuffle(s == "1"));
+            }
             StatusCode::OK
         }
         "refreshPlayQueue" => {
@@ -2633,7 +3440,9 @@ async fn playback_cmd_handler(
                 // Plain read — no own=1, which would claim the queue for
                 // this client and can retire the one we're holding.
                 let queue_server = state.queue_source.lock().unwrap().0.clone();
-                let url = format!("{queue_server}/playQueues/{id}?includeChapters=1");
+                let url = format!(
+                    "{queue_server}/playQueues/{id}?includeChapters=1&window={QUEUE_WINDOW}"
+                );
                 match queue_request(&state, reqwest::Method::GET, &url).await {
                     Ok(mc) => apply_queue_edit(&state, mc),
                     Err(e) => eprintln!("queue refresh failed: {e}"),
@@ -2711,6 +3520,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/sections", get(sections_handler))
         .route("/api/sections/:key", get(section_items_handler))
         .route("/api/browse/:rating_key", get(browse_handler))
+        .route("/api/sections/:key/albums", get(section_albums_handler))
+        .route("/api/sections/:key/tracks", get(section_tracks_handler))
+        .route("/api/shuffle-library/:key", post(shuffle_library_handler))
+        .route("/api/search", get(search_handler))
         .route("/api/play/:rating_key", post(play_handler))
         .route("/api/play-album/:rating_key", post(play_album_handler))
         .route("/api/pause", post(pause_handler))
@@ -2722,6 +3535,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/seek", post(seek_handler))
         .route("/api/volume", post(volume_handler))
         .route("/api/skipto", post(skipto_handler))
+        .route("/api/repeat", post(repeat_handler))
+        .route("/api/shuffle", post(shuffle_handler))
         .route("/api/queue/add", post(queue_add_handler))
         .route("/api/queue/remove", post(queue_remove_handler))
         .route("/api/status", get(status_handler))
