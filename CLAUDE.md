@@ -7,12 +7,14 @@ Context for working on RustAmp. Read this before changing anything.
 A headless Plex music player: a Rust daemon that plays audio on the machine
 it runs on, serves a web UI for control, and implements enough of the Plex
 Companion protocol to appear as a playback target in the Plex/Plexamp phone
-apps. Targets Raspberry Pi (32- and 64-bit), Linux x86-64, and Windows
-(x64/ARM64).
+apps. Targets Raspberry Pi (32- and 64-bit), Linux x86-64, Windows
+(x64/ARM64) and macOS.
 
-Everything currently works: claim-code auth, library browsing, queue
-playback with prefetch, transport controls, queue editing, and two-way sync
-with the phone app.
+Everything currently works: claim-code auth, library browsing (by artist,
+album or song title), search, queue playback with prefetch, transport
+controls, queue editing, shuffle and repeat, playback reporting to the
+server, transcode fallback for codecs Symphonia can't decode, and two-way
+sync with the phone app.
 
 ## Layout
 
@@ -56,11 +58,51 @@ Each of these cost real debugging. They look arbitrary; they aren't.
 
 6. **Track downloads retry once with freshly fetched metadata on 404.**
    Plex part keys embed a version that goes stale when the server
-   re-analyzes a file.
+   re-analyzes a file. A *truncated* body retries the same URL instead:
+   the key was fine, the connection died.
 
 7. **Output format is negotiated, not assumed.** `audio::open` returns the
    format it actually got; the player resamples when it differs. WASAPI
    shared mode usually only accepts the device's mix format.
+
+8. **Every play queue mutation is followed by a read-back with `window=`.**
+   PMS answers with a 21-item window and *ignores* `window` on the
+   POST/PUT/DELETE that change a queue — only a plain GET honours it.
+   Without the read-back a long album silently stops after 21 tracks.
+   Note PMS caps what a client may see regardless: album-sized queues come
+   back complete, a 290-track artist queue returns 200, a 2700-track one
+   returns 700–900. Verified against PMS 1.43.4.
+
+9. **The transcode request needs two things that look removable.** It needs
+   the header `X-Plex-Client-Profile-Name: Generic`, because
+   `X-Plex-Client-Profile-Extra` only *adds* targets to a base profile and
+   PMS ships none for a product it has never heard of — without it you get
+   400 "unable to find a matching profile". And it needs a `decision` call
+   before `start.mp3`, sharing the same session and identical parameters,
+   or PMS denies access to "a session lacking decision". Skipping the
+   decision fails *intermittently* — the first transcode after a restart
+   usually works and later ones 400, and a session can be killed mid-stream
+   — which makes the omission look harmless. Sessions also stay open until
+   explicitly stopped.
+
+10. **Shuffle mode and Shuffle Play are different features.** Shuffle mode
+    is player-side: the queue keeps its order and the player picks the next
+    track at random, playing every track once before repeating any. The
+    Shuffle buttons on albums/artists and "Shuffle everything" instead ask
+    PMS to build a queue that is already shuffled, so the phone's "up next"
+    shows the real order. Do not try to implement shuffle mode by
+    reordering the queue: PMS has no way to reorder one in place
+    (`/playQueues/{id}/shuffle` is a music-provider endpoint that 404s on a
+    local server), and a local reorder would desync the phone's view.
+
+11. **Plex's repeat vocabulary is 0 off, 1 *this track*, 2 *the queue*.**
+    Not the 1-is-all ordering that gets quoted around. Checked against
+    Plexamp; getting it backwards silently swaps the two modes.
+
+12. **Flat listings sort with `sort=title`, not `sort=titleSort`.** The
+    latter is what Plex's own UIs use, but it comes back in an order that
+    is not alphabetical by anything we display, which looks broken in an
+    A–Z list.
 
 ## Conventions
 
@@ -69,12 +111,18 @@ Each of these cost real debugging. They look arbitrary; they aren't.
 - Errors that a user can act on go to stderr with enough detail to act on
   (which device, which URL — redact tokens with `redact()`). Avoid
   per-track or per-request logging; it was removed deliberately once things
-  worked.
+  worked. Log failures with `{e:#}` so anyhow prints the source chain —
+  "error decoding response body" alone doesn't say which of two very
+  different causes it was.
 - The web UI is deliberately dependency-free: no framework, no build step,
   no external assets. Keep it that way.
 - The player thread owns all playback state and is driven by `PlayerCmd`
   over a channel; web handlers never touch it directly. Status flows back
   through `SharedStatus`.
+- The player thread never touches the network. Downloads happen in async
+  handlers and the prefetcher, which hand finished bytes over. Keep it that
+  way: a blocking network read in the audio loop would freeze the transport
+  controls along with playback.
 
 ## Testing
 
@@ -89,56 +137,60 @@ much. Manual checks that catch most regressions:
   the player must keep playing (regression test for decision 2).
 - Add and remove queue items from both the web UI and the phone; both
   views should agree.
+- Play an album with more than 21 tracks and confirm it doesn't stop at 21
+  (regression test for decision 8).
+- Play a track in a codec Symphonia can't decode (WMA, Opus) and confirm it
+  plays; then check `/transcode/sessions` returns to 0 afterwards.
+- Turn shuffle mode on and confirm the queue order in the phone's "up next"
+  does *not* change while playback jumps around it. Then use an album's
+  Shuffle button and confirm the phone's queue order *does* change.
+- Set repeat to "this track" and confirm it replays without re-downloading.
+- Search, and browse by album and by song title, on a library big enough to
+  be slow (thousands of tracks).
 
 ## Roadmap
 
-Roughly in priority order. Items 1 and 2 are the ones a user would notice
-missing first.
+Roughly in priority order.
 
-1. **Report playback to Plex.** Nothing is currently recorded: no play
-   counts, no last-played, no "continue listening", no Last.fm scrobbling.
-   Needs periodic `POST /:/timeline` to the server with
-   `ratingKey`/`key`/`state`/`time`/`duration`, plus a `playing` ping on
-   start and `stopped` at the end. Small change, biggest user-visible win.
-
-2. **Search.** `GET /library/sections/{key}/search?query=` or the global
-   `/hubs/search`. The UI needs a search field in the header and a results
-   view grouping artists/albums/tracks.
-
-3. **Gapless playback.** Currently the device is opened and closed per
-   track. Keep one device open across tracks of the same format and feed
-   the next decoder straight into it.
-
-4. **Shuffle and repeat.** The timeline hardcodes both to `0`. Needs
-   player-side support plus honoring `setParameters?shuffle=/repeat=` from
-   the phone.
-
-5. **Transcode fallback.** We direct-play only and fail on anything
-   Symphonia can't decode. Fall back to
-   `/music/:/transcode/universal/start.mp3` when direct play fails.
-
-6. **Stream instead of buffering whole tracks.** Currently each track is
-   downloaded fully into memory before playing, which is why the first
-   track has a noticeable delay.
-
-7. **Loudness leveling.** Plex analyzes tracks for this and Plexamp uses
+1. **Loudness leveling.** Plex analyzes tracks for this and Plexamp uses
    it; we ignore it. Read `gainRef`/`loudnessAnalysisVersion` from the
    track metadata and apply gain.
 
-8. **Playlists**, browsing by genre/year, recently added, most played.
+2. **Playlists**, browsing by genre/year, recently added, most played.
+   (Browsing by album name and song title, and shuffling a whole artist or
+   the whole library, are done.)
 
-9. **Persist state across restarts** so the player resumes where it left
+3. **Persist state across restarts** so the player resumes where it left
    off.
 
-10. **GDM discovery** (UDP broadcast on 32410-32414) so the player is
-    findable on the LAN without going through plex.tv.
+4. **GDM discovery** (UDP broadcast on 32410-32414) so the player is
+   findable on the LAN without going through plex.tv.
 
-11. **Companion pubsub websocket.** We're poll-only, which is why
-    `pubsub-player` is deliberately absent from `PROTOCOL_CAPABILITIES` —
-    advertising it without implementing it makes controllers relay
-    commands we'd drop.
+5. **Companion pubsub websocket.** We're poll-only, which is why
+   `pubsub-player` is deliberately absent from `PROTOCOL_CAPABILITIES` —
+   advertising it without implementing it makes controllers relay commands
+   we'd drop.
 
-12. **Hardware volume** via the ALSA mixer instead of software gain.
+6. **Hardware volume** via the ALSA mixer instead of software gain.
+
+### Considered and deliberately deferred
+
+- **Gapless playback.** The device is still opened and closed per track,
+  so there is a real seam between them. Judged inaudible in practice on
+  this setup; revisit if a continuous album (live set, DJ mix, opera)
+  exposes it. Doing it properly means one device held open across tracks of
+  the same format, and reworking decision 4's rewind, which currently
+  assumes the device buffer belongs to a single track.
+
+- **Streaming instead of buffering whole tracks.** Measured before
+  deciding: Symphonia needs 31 KB of an MP3, 131 KB of a FLAC and 623 KB of
+  an M4A to produce the first second of audio, with zero seeks — so
+  streaming would work. But at ~25 MB/s on the LAN the full-download wait
+  is only 0.16 s (mp3), 0.37 s (aac) and 1.23 s (flac), and only on the
+  first track, since prefetch covers the rest. Not worth a blocking network
+  read in the player thread plus a new starvation path, and it would cost
+  the pre-playback truncation retry in decision 6. Revisit if the daemon
+  ever runs somewhere with much slower networking.
 
 Not planned: video, photos, Tidal, speaker groups.
 
@@ -152,3 +204,10 @@ Not planned: video, photos, Tidal, speaker groups.
 - Claim codes from plex.tv/claim expire in a few minutes.
 - The config file at `~/.config/rustamp/config.json` holds a live Plex
   auth token. Never commit it, never paste it in logs or issues.
+- A library can hold an unmatched local album (`guid = local://…`) that
+  shares a title with a properly matched one, so the same album name
+  appears twice with different artwork and track counts. Plex's own clients
+  show both. It's a library metadata problem, not a listing bug — don't
+  "fix" it by deduplicating on title, which would hide real tracks.
+- Transcode sessions do not close themselves. If transcoding starts
+  failing with 400, check `/transcode/sessions` for one left open.
