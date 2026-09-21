@@ -104,6 +104,28 @@ Each of these cost real debugging. They look arbitrary; they aren't.
     is not alphabetical by anything we display, which looks broken in an
     A–Z list.
 
+13. **`playMedia` arrives in three shapes and all three are load-bearing.**
+    A `containerKey` naming an existing `/playQueues/…` (adopt that queue),
+    a `uri` naming a source to build a queue *from* (e.g.
+    `server://<machine>/com.plexapp.plugins.library/library/metadata/6609/children`),
+    or a bare `key` for a single item. The `uri` form is how the phone
+    starts playback when the player is idle; without it the phone reports
+    "Can't start playback", and — because it then has no queue on us — it
+    falls back to sending single items, which looks like adding a track
+    silently replacing the queue. Related: **the phone sends the literal
+    string `"undefined"`** for parameters it has no value for, so an absent
+    `uri` arrives as `uri=undefined`, not as a missing key. Treat it as
+    absent.
+
+14. **A queue edit keeps the queue where it already lives.**
+    `apply_queue_edit` takes the machine/address/port from the *current*
+    queue, not from our configured server. A queue the phone created can be
+    on a different address (it addresses the server by a `plex.direct`
+    HTTPS name), and rewriting the timeline to point at ours means the
+    controller can no longer reconcile its queue — which per decision 2
+    makes it stop the player. Only fall back to `local_queue_info()` when
+    there is no queue yet.
+
 ## Conventions
 
 - Comments explain *why*, not what. The non-obvious constraints above are
@@ -123,6 +145,14 @@ Each of these cost real debugging. They look arbitrary; they aren't.
   handlers and the prefetcher, which hand finished bytes over. Keep it that
   way: a blocking network read in the audio loop would freeze the transport
   controls along with playback.
+- Companion replies are XML, errors included (`plex_err`). A controller that
+  gets a bare status with a text body can only report a generic failure, so
+  returning `err_response` from a `/player/…` handler both misleads the
+  phone and tells us nothing. `err_response` is for the `/api/…` handlers,
+  where the web UI surfaces the text in a toast.
+- An unimplemented companion command is still acknowledged — a non-Plex
+  reply makes controllers report generic failures — but it logs that it did
+  nothing, so a missing feature doesn't look like a working one.
 
 ## Testing
 
@@ -147,6 +177,15 @@ much. Manual checks that catch most regressions:
 - Set repeat to "this track" and confirm it replays without re-downloading.
 - Search, and browse by album and by song title, on a library big enough to
   be slow (thousands of tracks).
+- With nothing playing, start a song from the phone — it must start, not
+  report "Can't start playback" (regression test for decision 13). Then add
+  a track from the phone and confirm it joins the queue instead of
+  replacing it.
+
+When the phone misbehaves and nothing appears on stderr, run the daemon with
+`RUSTAMP_DEBUG_COMPANION=1`. It logs every companion request and its
+parameters (token redacted), which is the only way to see what a controller
+actually sent. Leave it off otherwise; it's per-request logging.
 
 ## Roadmap
 
