@@ -2225,8 +2225,13 @@ impl AppState {
 }
 
 // Everything PMS tells us about a queue it just handed back.
-fn queue_info_from(state: &AppState, mc: &MetadataContainer) -> QueueInfo {
-    let mut info = state.local_queue_info();
+// `base` says where the queue lives; only the per-response fields come from
+// `mc`. A caller that just created a queue on our own server passes
+// local_queue_info(); an edit to an existing queue must pass that queue's
+// current info, because a queue the phone built can live on a different
+// server and the timeline has to keep pointing at it.
+fn queue_info_from(base: QueueInfo, mc: &MetadataContainer) -> QueueInfo {
+    let mut info = base;
     info.play_queue_id = mc.play_queue_id;
     info.play_queue_version = mc.play_queue_version;
     info.container_key = mc.play_queue_id.map(|id| format!("/playQueues/{id}"));
@@ -2295,16 +2300,28 @@ async fn create_play_queue_uri(
     start_track_key: Option<&str>,
     shuffle: bool,
 ) -> anyhow::Result<(Vec<Metadata>, usize, QueueInfo)> {
+    let (server_url, token) = (state.server_url.clone(), state.token.clone());
+    create_play_queue_on(state, &server_url, &token, uri, start_track_key, shuffle).await
+}
+
+async fn create_play_queue_on(
+    state: &AppState,
+    server_url: &str,
+    token: &str,
+    uri: &str,
+    start_track_key: Option<&str>,
+    shuffle: bool,
+) -> anyhow::Result<(Vec<Metadata>, usize, QueueInfo)> {
     let mut url = format!(
         "{}/playQueues?type=audio&uri={}&continuous=0&repeat=0&shuffle={}&includeChapters=1&own=1",
-        state.server_url,
+        server_url,
         urlencoding::encode(uri),
         u8::from(shuffle)
     );
     if let Some(k) = start_track_key {
         url.push_str(&format!("&key={}", urlencoding::encode(k)));
     }
-    let req = state.client.post(&url).header("X-Plex-Token", &state.token);
+    let req = state.client.post(&url).header("X-Plex-Token", token);
     let resp = plex_headers(req).send().await?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -2316,7 +2333,7 @@ async fn create_play_queue_uri(
     // The POST answers with a window, not the queue.
     if is_windowed(&mc) {
         if let Some(id) = mc.play_queue_id {
-            mc = fetch_full_queue(&state.client, &state.server_url, &state.token, id).await?;
+            mc = fetch_full_queue(&state.client, server_url, token, id).await?;
         }
     }
     let start = mc
@@ -2327,7 +2344,7 @@ async fn create_play_queue_uri(
                 && m.play_queue_item_id == mc.play_queue_selected_item_id
         })
         .unwrap_or(0);
-    let info = queue_info_from(state, &mc);
+    let info = queue_info_from(state.local_queue_info(), &mc);
     Ok((mc.metadata, start, info))
 }
 
@@ -2624,7 +2641,19 @@ fn spawn_timeline_reporter(state: &AppState) {
 // player and restarts prefetching for the new track order.
 fn apply_queue_edit(state: &AppState, mc: MetadataContainer) {
     let serial = state.next_serial();
-    let info = queue_info_from(state, &mc);
+    // Keep the queue where it already is. Rebuilding this from our configured
+    // server repoints the timeline at the wrong machine for any queue the
+    // phone created, and a controller that cannot reconcile its queue stops
+    // the player (decision 2).
+    let base = {
+        let s = state.status.lock().unwrap();
+        if s.info.machine_identifier.is_empty() {
+            state.local_queue_info()
+        } else {
+            s.info.clone()
+        }
+    };
+    let info = queue_info_from(base, &mc);
     let (src_url, src_token) = state.queue_source.lock().unwrap().clone();
     let queued: Vec<QueuedTrack> = mc.metadata.iter().map(to_queued).collect();
     let _ = state.player_tx.send(PlayerCmd::ReplaceQueue {
@@ -3146,6 +3175,38 @@ fn plex_xml(body: String) -> axum::response::Response {
         .into_response()
 }
 
+// Companion replies are XML. Answering a controller with a bare status and a
+// text body makes it report a generic failure, and tells us nothing about why.
+fn plex_err(context: &str, e: anyhow::Error) -> axum::response::Response {
+    eprintln!("companion {context} failed: {e:#}");
+    plex_xml(format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><Response code="500" status="{}"/>"#,
+        xml_escape(&e.to_string())
+    ))
+}
+
+// What the phone actually sent. Off unless RUSTAMP_DEBUG_COMPANION is set,
+// because this is per-request logging; it is the only way to see a controller's
+// side of a conversation that otherwise fails silently.
+fn log_companion(path: &str, params: &Params) {
+    if std::env::var_os("RUSTAMP_DEBUG_COMPANION").is_none() {
+        return;
+    }
+    let mut kv: Vec<String> = params
+        .iter()
+        .map(|(k, v)| {
+            let shown = if k.eq_ignore_ascii_case("token") || k.contains("Token") {
+                "…"
+            } else {
+                v.as_str()
+            };
+            format!("{k}={shown}")
+        })
+        .collect();
+    kv.sort();
+    eprintln!("companion {path} {}", kv.join(" "));
+}
+
 fn plex_ok() -> axum::response::Response {
     plex_xml(r#"<?xml version="1.0" encoding="UTF-8"?><Response code="200" status="OK"/>"#.into())
 }
@@ -3301,6 +3362,7 @@ async fn play_media_handler(
         .and_then(|o| o.parse().ok())
         .unwrap_or(0);
     let paused = params.get("paused").map(|p| p == "1").unwrap_or(false);
+    log_companion("playMedia", &params);
 
     let server_url = match (&address, &port) {
         (Some(a), Some(p)) => format!("{protocol}://{a}:{p}"),
@@ -3310,6 +3372,23 @@ async fn play_media_handler(
 
     let container_key = params.get("containerKey").cloned();
     let key = params.get("key").cloned();
+    // The phone sends a literal "undefined" for absent values; treat an empty
+    // or "undefined" uri as no uri at all.
+    let uri = params
+        .get("uri")
+        .filter(|u| !u.is_empty() && u.as_str() != "undefined")
+        .cloned();
+
+    // The controller names its server by machineIdentifier and hands us one of
+    // its addresses, usually a plex.direct HTTPS name. When that is the server
+    // we are already configured for, build the queue over our own connection:
+    // it is known to work from here, and does not depend on the hashed
+    // hostname resolving or on TLS to a LAN address.
+    let (queue_server, queue_token) = if machine_id == state.server_machine_id {
+        (state.server_url.clone(), state.token.clone())
+    } else {
+        (server_url.clone(), token.clone())
+    };
 
     let (tracks, start_index, info) = match &container_key {
         Some(ck) if ck.contains("/playQueues/") => {
@@ -3321,7 +3400,7 @@ async fn play_media_handler(
             let r: MetadataResponse =
                 match plex_get_json(&state.client, &url, &token).await {
                     Ok(r) => r,
-                    Err(e) => return err_response(e),
+                    Err(e) => return plex_err("playMedia (reading the queue)", e),
                 };
             let mc = r.media_container;
             let selected = mc.play_queue_selected_item_id;
@@ -3345,15 +3424,39 @@ async fn play_media_handler(
             };
             (mc.metadata, start, info)
         }
+        // No existing queue, but the controller named a source to build one
+        // from. This is how the phone starts playback when we are idle: it
+        // sends `uri` with no containerKey, and without this we answered
+        // "missing key" and it reported "Can't start playback".
+        _ if uri.is_some() => {
+            let uri = uri.as_deref().unwrap_or_default();
+            let shuffle = params.get("shuffle").map(|v| v == "1").unwrap_or(false);
+            match create_play_queue_on(
+                &state,
+                &queue_server,
+                &queue_token,
+                uri,
+                key.as_deref(),
+                shuffle,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => return plex_err("playMedia (building the queue)", e),
+            }
+        }
         _ => {
-            // No play queue: play the single item named by `key`.
+            // No play queue and no source: play the single item named by `key`.
             let Some(k) = key else {
-                return (StatusCode::BAD_REQUEST, "missing key").into_response();
+                return plex_err(
+                    "playMedia",
+                    anyhow::anyhow!("no containerKey, uri or key in the request"),
+                );
             };
             let rating_key = k.rsplit('/').next().unwrap_or(&k).to_string();
             let track = match fetch_item(&state.client, &server_url, &token, &rating_key).await {
                 Ok(t) => t,
-                Err(e) => return err_response(e),
+                Err(e) => return plex_err("playMedia (reading the item)", e),
             };
             let info = QueueInfo {
                 machine_identifier: machine_id,
@@ -3381,7 +3484,7 @@ async fn play_media_handler(
     .await
     {
         Ok(()) => plex_ok(),
-        Err(e) => err_response(e),
+        Err(e) => plex_err("playMedia (starting playback)", e),
     }
 }
 
@@ -3390,6 +3493,7 @@ async fn playback_cmd_handler(
     Path(cmd): Path<String>,
     axum::extract::Query(params): axum::extract::Query<Params>,
 ) -> impl IntoResponse {
+    log_companion(&cmd, &params);
     match cmd.as_str() {
         "play" => send_cmd(&state, PlayerCmd::Resume),
         "pause" => send_cmd(&state, PlayerCmd::Pause),
@@ -3450,7 +3554,13 @@ async fn playback_cmd_handler(
             }
             StatusCode::OK
         }
-        _ => StatusCode::NOT_FOUND,
+        other => {
+            // Acknowledged anyway, because a controller that gets a non-Plex
+            // reply reports a generic failure; but say so, since otherwise an
+            // unimplemented command is indistinguishable from one that worked.
+            eprintln!("companion command not implemented: {other}");
+            StatusCode::OK
+        }
     };
     plex_ok()
 }
