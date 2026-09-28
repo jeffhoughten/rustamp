@@ -6,3 +6,6 @@ image = "rustamp-cross-aarch64"
 
 [target.x86_64-unknown-linux-gnu]
 image = "rustamp-cross-x86_64"
+
+[target.armv7-unknown-linux-musleabihf]
+image = "rustamp-cross-armv7-musl"

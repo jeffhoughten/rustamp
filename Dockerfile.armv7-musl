@@ -1,0 +1,30 @@
+FROM ghcr.io/cross-rs/armv7-unknown-linux-musleabihf:main
+
+# There is no musl armhf build of libasound in any distro repo, so build it
+# from source against the image's musl toolchain. Only the PCM/mixer bits
+# are needed; the rest is disabled to keep the build short.
+ARG ALSA_VERSION=1.2.11
+ENV MUSL_PREFIX=/usr/local/armv7-musl
+ENV CROSS_HOST=arm-linux-musleabihf
+
+RUN apt-get update && apt-get install -y curl bzip2 build-essential
+
+RUN curl -fsSL "https://www.alsa-project.org/files/pub/lib/alsa-lib-${ALSA_VERSION}.tar.bz2" \
+      -o /tmp/alsa-lib.tar.bz2 \
+ && tar xf /tmp/alsa-lib.tar.bz2 -C /tmp \
+ && cd "/tmp/alsa-lib-${ALSA_VERSION}" \
+ && ./configure \
+      --host="${CROSS_HOST}" \
+      CC="${CROSS_HOST}-gcc" \
+      --prefix="${MUSL_PREFIX}" \
+      --enable-static --disable-shared \
+      --disable-python --disable-seq --disable-rawmidi \
+      --disable-ucm --disable-topology \
+ && make -j"$(nproc)" \
+ && make install \
+ && rm -rf /tmp/alsa-lib*
+
+# alsa-sys finds the library through pkg-config.
+ENV PKG_CONFIG_ALLOW_CROSS=1 \
+    PKG_CONFIG_PATH="${MUSL_PREFIX}/lib/pkgconfig" \
+    PKG_CONFIG_ALL_STATIC=1

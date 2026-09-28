@@ -6,3 +6,8 @@ rustflags = ["-C", "target-cpu=cortex-a7"]
 # that runs on older 64-bit Pis too.
 [target.aarch64-unknown-linux-gnu]
 rustflags = ["-C", "target-cpu=cortex-a76"]
+
+# Static musl build for 32-bit Pi. Needs the alsa-lib built into the
+# rustamp-cross-armv7-musl image (see Dockerfile.armv7-musl).
+[target.armv7-unknown-linux-musleabihf]
+rustflags = ["-C", "target-cpu=cortex-a7", "-L", "/usr/local/armv7-musl/lib"]
