@@ -255,7 +255,22 @@ struct LibrarySectionsResponse {
 #[derive(Deserialize, Debug, Clone)]
 struct Part {
     key: String,
+    // Lyrics ride along as a stream on the part; streamType 4 is the lyric
+    // one. PMS includes these in a plain metadata fetch.
+    #[serde(rename = "Stream", default)]
+    stream: Vec<Stream>,
 }
+
+#[derive(Deserialize, Debug, Clone)]
+struct Stream {
+    #[serde(rename = "streamType")]
+    stream_type: Option<u32>,
+    key: Option<String>,
+    // "lrc" means timed; "txt" is a plain block.
+    format: Option<String>,
+}
+
+const STREAM_TYPE_LYRIC: u32 = 4;
 
 #[derive(Deserialize, Debug, Clone)]
 struct Media {
@@ -278,7 +293,19 @@ struct Metadata {
     #[serde(rename = "parentTitle")]
     parent_title: Option<String>, // album title, when this is a track
     #[serde(rename = "grandparentTitle")]
-    grandparent_title: Option<String>, // artist title, when this is a track
+    grandparent_title: Option<String>, // album artist, when this is a track
+    // The track's own artist. On a compilation grandparentTitle is "Various
+    // Artists" while this names who actually performed it, so it wins when
+    // present — the same precedence Plexamp uses throughout.
+    #[serde(rename = "originalTitle")]
+    original_title: Option<String>,
+    #[serde(rename = "parentRatingKey")]
+    parent_rating_key: Option<String>, // the album
+    #[serde(rename = "grandparentRatingKey")]
+    grandparent_rating_key: Option<String>, // the artist
+    // Plex stores a 0-10 rating; the UI shows it as five stars.
+    #[serde(rename = "userRating")]
+    user_rating: Option<f32>,
     duration: Option<u64>, // ms
     #[serde(rename = "playQueueItemID")]
     play_queue_item_id: Option<u64>,
@@ -737,8 +764,14 @@ async fn fetch_server_machine_id(
 struct QueuedTrack {
     title: String,
     artist: Option<String>,
+    album: Option<String>,
     key: String,
     rating_key: String,
+    // Where the now playing view's "go to album/artist" links point.
+    album_rating_key: Option<String>,
+    artist_rating_key: Option<String>,
+    artist_thumb: Option<String>,
+    user_rating: Option<f32>,
     play_queue_item_id: Option<u64>,
     duration_ms: u64,
     thumb: Option<String>,
@@ -786,6 +819,9 @@ enum PlayerCmd {
     SetVolume(u8),
     SetRepeat(u8),
     SetShuffle(bool),
+    // The player holds its own copy of each track, so a rating set from the
+    // UI has to be reflected there or the next status poll undoes it.
+    SetRating(String, f32),
     Stop,
 }
 
@@ -799,8 +835,13 @@ const REPEAT_ALL: u8 = 2;
 struct TrackInfo {
     title: String,
     artist: Option<String>,
+    album: Option<String>,
     key: String,
     rating_key: String,
+    album_rating_key: Option<String>,
+    artist_rating_key: Option<String>,
+    artist_thumb: Option<String>,
+    user_rating: Option<f32>,
     play_queue_item_id: Option<u64>,
     duration_ms: u64,
     thumb: Option<String>,
@@ -846,8 +887,13 @@ fn set_status(
         .map(|t| TrackInfo {
             title: t.title.clone(),
             artist: t.artist.clone(),
+            album: t.album.clone(),
             key: t.key.clone(),
             rating_key: t.rating_key.clone(),
+            album_rating_key: t.album_rating_key.clone(),
+            artist_rating_key: t.artist_rating_key.clone(),
+            artist_thumb: t.artist_thumb.clone(),
+            user_rating: t.user_rating,
             play_queue_item_id: t.play_queue_item_id,
             duration_ms: t.duration_ms,
             thumb: t.thumb.clone(),
@@ -1094,6 +1140,13 @@ fn spawn_player_thread(status: SharedStatus) -> std_mpsc::Sender<PlayerCmd> {
                         played.clear();
                         set_shuffle(&status, shuffle);
                     }
+                    Ok(PlayerCmd::SetRating(rk, rating)) => {
+                        for t in queue.iter_mut().filter(|t| t.rating_key == rk) {
+                            t.user_rating = (rating >= 0.0).then_some(rating);
+                        }
+                        let idx = if idle { None } else { Some(current_index) };
+                        set_status(&status, &queue, idx, paused, volume, &info);
+                    }
                     Ok(PlayerCmd::Stop) => {
                         queue.clear();
                         current_index = 0;
@@ -1268,6 +1321,12 @@ fn spawn_player_thread(status: SharedStatus) -> std_mpsc::Sender<PlayerCmd> {
                             shuffle = on;
                             played.clear();
                             set_shuffle(&status, shuffle);
+                        }
+                        Ok(PlayerCmd::SetRating(rk, rating)) => {
+                            for t in queue.iter_mut().filter(|t| t.rating_key == rk) {
+                                t.user_rating = (rating >= 0.0).then_some(rating);
+                            }
+                            set_status(&status, &queue, Some(current_index), paused, volume, &info);
                         }
                         Ok(PlayerCmd::Stop) => break 'track TrackOutcome::Stopped,
                         Ok(PlayerCmd::SetBytes(index, b)) => {
@@ -1514,6 +1573,43 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
   .empty { color: var(--muted); padding: 40px 0; text-align: center; }
 
+  /* Now playing view */
+  #npv { display: none; }
+  #npv.on { display: flex; gap: 40px; align-items: center; padding: 20px 0 40px; flex-wrap: wrap; }
+  #npv .cover, #npv .cover img {
+    width: 340px; height: 340px; border-radius: var(--radius); flex: none;
+    box-shadow: 0 20px 60px rgba(0,0,0,.65); background: var(--panel-2);
+  }
+  #npv .cover img { display: block; object-fit: cover; box-shadow: none; }
+  #npv .cover.ph { display: grid; place-items: center; font-size: 110px; color: #4a4a52; }
+  #npv .info { min-width: 0; flex: 1; }
+  #npv .sub { color: var(--muted); font-size: 13px; letter-spacing: .12em; text-transform: uppercase; }
+  #npv h1 { margin: 10px 0 14px; font-size: 40px; line-height: 1.1; }
+  #npv .meta { font-size: 17px; margin-bottom: 6px; }
+  #npv .meta a { color: var(--accent-2); cursor: pointer; text-decoration: none; }
+  #npv .meta a:hover { text-decoration: underline; }
+  #npv .meta .muted { color: var(--muted); }
+  #npv .empty { color: var(--muted); }
+  #npv .stars { display: flex; gap: 4px; margin: 16px 0 4px; }
+  #npv .stars button {
+    background: none; border: 0; padding: 0; cursor: pointer; line-height: 1;
+    font-size: 26px; color: #4a4a52;
+  }
+  #npv .stars button.lit { color: var(--accent); }
+  #npv .stars button.pre { color: var(--accent-2); }
+  #npv .lyrics {
+    margin-top: 22px; max-height: 260px; overflow-y: auto;
+    border-top: 1px solid #2a2a2e; padding-top: 14px;
+  }
+  #npv .lyrics .ln { color: var(--muted); padding: 3px 0; font-size: 15px; }
+  #npv .lyrics .ln.on { color: var(--text); font-weight: 600; }
+  #npv .lyrics .by { color: #5a5a62; font-size: 12px; margin-top: 10px; }
+  @media (max-width: 720px) {
+    #npv.on { gap: 20px; }
+    #npv .cover, #npv .cover img { width: 200px; height: 200px; }
+    #npv h1 { font-size: 26px; }
+  }
+
   /* Artwork placeholder, for items the library has no image for */
   .ph { display: grid; place-items: center; background: var(--panel-2); color: #4a4a52; }
   .art.ph { font-size: 38px; }
@@ -1558,9 +1654,16 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
   #np .meta .cover {
     width: 56px; height: 56px; border-radius: 6px; flex: none;
     background: var(--panel-2); display: grid; place-items: center;
-    color: #555; font-size: 22px;
+    color: #555; font-size: 22px; position: relative;
   }
-  #np .meta .cover img { width: 100%; height: 100%; border-radius: 6px; object-fit: cover; display: none; }
+  /* The placeholder glyph is a bare text node, so it is an anonymous grid
+     item. Leaving the image in grid flow puts the two in separate rows and
+     squashes the artwork into the lower half; take the image out of flow so
+     it covers the tile instead. */
+  #np .meta .cover img {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    border-radius: 6px; object-fit: cover; display: none;
+  }
   #np .meta .cover.has-art img { display: block; }
   #np .meta .cover.has-art { color: transparent; }
   #np .meta .t { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -1642,6 +1745,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 </header>
 
 <main>
+  <div id="npv"></div>
   <div id="hero"></div>
   <div id="content"></div>
 </main>
@@ -1673,6 +1777,9 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       </button>
       <button class="ib" onclick="post('/api/skip')" title="Next">
         <svg viewBox="0 0 24 24"><path d="M16 6h2v12h-2zM6 18l8.5-6L6 6z"/></svg>
+      </button>
+      <button class="ib" id="npv-btn" onclick="toggleNowPlaying()" title="Now playing">
+        <svg viewBox="0 0 24 24"><path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z"/></svg>
       </button>
       <button class="ib" id="rp-btn" onclick="cycleRepeat()" title="Repeat">
         <svg id="ic-rp" viewBox="0 0 24 24"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/></svg>
@@ -1738,6 +1845,9 @@ function art(path, size, cls, lazy) {
   const src = thumb(path, size);
   return lazy ? `<img class="${c}" data-src="${src}">` : `<img class="${c}" src="${src}">`;
 }
+// A track's own artist when it has one; grandparentTitle is the *album*
+// artist, which on a compilation reads "Various Artists".
+const trackArtist = t => t.originalTitle || t.grandparentTitle || "";
 const fmt = ms => { const s = Math.floor((ms||0)/1000); return `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`; };
 const post = async (url) => {
   try {
@@ -1847,7 +1957,7 @@ async function sectionSongs(key) {
   const ul = document.createElement("ul"); ul.className = "tracks";
   items.forEach(t => {
     const li = el(`<li data-rk="${t.ratingKey}"><span class="n">&#9834;</span>
-      <span class="t">${esc(t.title)}<span class="sub2"> &mdash; ${esc(t.grandparentTitle || "")}</span></span>
+      <span class="t">${esc(t.title)}<span class="sub2"> &mdash; ${esc(trackArtist(t))}</span></span>
       <span class="acts">
         <button class="mini" data-act="next" title="Play next">Next</button>
         <button class="mini" data-act="add" title="Add to queue">+</button>
@@ -1983,7 +2093,7 @@ async function showSearch(q) {
     const ul = document.createElement("ul"); ul.className = "tracks";
     r.tracks.forEach(t => {
       const li = el(`<li data-rk="${t.ratingKey}"><span class="n">♪</span>
-        <span class="t">${esc(t.title)}<span class="sub2"> — ${esc(t.grandparentTitle || "")}</span></span>
+        <span class="t">${esc(t.title)}<span class="sub2"> — ${esc(trackArtist(t))}</span></span>
         <span class="acts">
           <button class="mini" data-act="next" title="Play next">Next</button>
           <button class="mini" data-act="add" title="Add to queue">+</button>
@@ -2003,6 +2113,158 @@ async function showSearch(q) {
   if (!box.childNodes.length) box.innerHTML = `<div class="empty">No results for "${esc(q)}"</div>`;
   swap(box);
   markNow();
+}
+
+// ---- now playing ----
+// A toggled view rather than a route: the library stays exactly where it was,
+// so turning it off puts you back without re-navigating.
+let npvOpen = false, npvSig = "";
+
+function toggleNowPlaying() {
+  npvOpen = !npvOpen;
+  $("npv-btn").classList.toggle("on", npvOpen);
+  $("npv").classList.toggle("on", npvOpen);
+  // Hide the library rather than discard it; nothing needs re-fetching.
+  $("hero").style.display = npvOpen ? "none" : "";
+  $("content").style.display = npvOpen ? "none" : "";
+  npvSig = "";
+  renderNowPlaying();
+}
+
+// Leaves the now playing view and navigates, so the links actually go
+// somewhere visible.
+function npvGo(label, load) {
+  if (npvOpen) toggleNowPlaying();
+  go(label, load);
+}
+
+function renderNowPlaying() {
+  if (!npvOpen) return;
+  const box = $("npv");
+  const t = last && last.current_index !== null ? last.queue[last.current_index] : null;
+  // Re-render only when the track changes; paint() runs four times a second.
+  const sig = t ? `${t.rating_key}|${t.play_queue_item_id}` : "";
+  if (sig === npvSig) {
+    // Same track, but the rating can still have changed under us.
+    if (t) renderStars(t);
+    return;
+  }
+  npvSig = sig;
+
+  if (!t) {
+    box.innerHTML = '<div class="empty">Nothing playing.</div>';
+    return;
+  }
+  box.innerHTML = "";
+  const cover = el(`<div class="cover">${t.thumb ? `<img src="${thumb(t.thumb, 600)}">` : "&#9835;"}</div>`);
+  if (!t.thumb) cover.classList.add("ph");
+  const img = cover.querySelector("img");
+  if (img) img.onerror = () => { cover.classList.add("ph"); cover.innerHTML = "&#9835;"; };
+
+  const info = el(`<div class="info">
+    <div class="sub">Now playing</div>
+    <h1>${esc(t.title)}</h1>
+    <div class="meta" id="npv-artist"></div>
+    <div class="meta" id="npv-album"></div>
+    <div class="stars" id="npv-stars"></div>
+    <div class="lyrics" id="npv-lyrics" style="display:none"></div>
+  </div>`);
+
+  // Only link where we know the rating key; otherwise show plain text rather
+  // than a link that goes nowhere.
+  const line = (host, label, name, rk, pick) => {
+    if (!name) return;
+    host.appendChild(el(`<span class="muted">${label} </span>`));
+    if (rk) {
+      const a = el(`<a>${esc(name)}</a>`);
+      a.onclick = () => pick();
+      host.appendChild(a);
+    } else {
+      host.appendChild(document.createTextNode(name));
+    }
+  };
+  box.appendChild(cover);
+  box.appendChild(info);
+  line($("npv-artist"), "by", t.artist, t.artist_rating_key,
+       () => npvGo(t.artist, () => showArtist({
+         ratingKey: t.artist_rating_key, title: t.artist, thumb: t.artist_thumb })));
+  line($("npv-album"), "from", t.album, t.album_rating_key,
+       () => npvGo(t.album, () => showAlbum({
+         ratingKey: t.album_rating_key, title: t.album, thumb: t.thumb, parentTitle: t.artist })));
+  renderStars(t);
+  loadLyrics(t);
+}
+
+// Plex stores 0-10; five stars, so each is worth two.
+function renderStars(t) {
+  const box = $("npv-stars");
+  if (!box) return;
+  const filled = Math.round((t.user_rating || 0) / 2);
+  if (box.dataset.filled === String(filled) && box.dataset.rk === t.rating_key) return;
+  box.dataset.filled = String(filled); box.dataset.rk = t.rating_key;
+  box.innerHTML = "";
+  for (let n = 1; n <= 5; n++) {
+    const b = el(`<button title="${n} star${n > 1 ? "s" : ""}">&#9733;</button>`);
+    if (n <= filled) b.classList.add("lit");
+    // Clicking the star you already have clears the rating, which is the only
+    // way back to unrated.
+    // -1 removes the rating; 0 would store an explicit zero instead.
+    b.onclick = () => post(`/api/rate?rating_key=${encodeURIComponent(t.rating_key)}&rating=${n === filled ? -1 : n * 2}`);
+    b.onmouseenter = () => [...box.children].forEach((c, i) => c.classList.toggle("pre", i < n));
+    box.appendChild(b);
+  }
+  box.onmouseleave = () => [...box.children].forEach(c => c.classList.remove("pre"));
+}
+
+// Rows kept above the active lyric line, so the rest of the panel shows what
+// is still to come.
+const LYRIC_LEAD = 4;
+let lyricsFor = null, lyricsData = null, lyricLine = -1;
+
+async function loadLyrics(t) {
+  const box = $("npv-lyrics");
+  if (!box) return;
+  lyricsFor = t.rating_key; lyricsData = null; lyricLine = -1;
+  box.style.display = "none"; box.innerHTML = "";
+  let r;
+  try { r = await (await fetch(`/api/lyrics/${t.rating_key}`)).json(); } catch (e) { return; }
+  // The track may have changed while that was in flight.
+  if (lyricsFor !== t.rating_key || !r || !r.lines || !r.lines.length) return;
+  lyricsData = r;
+  r.lines.forEach((l, i) => {
+    const d = el(`<div class="ln" data-i="${i}">${esc(l.text || "")}</div>`);
+    if (r.timed && l.start_ms != null) d.onclick = () => post(`/api/seek?ms=${l.start_ms}`);
+    box.appendChild(d);
+  });
+  if (r.provider) box.appendChild(el(`<div class="by">${esc(r.provider)}</div>`));
+  box.style.display = "";
+}
+
+// Highlights the line matching playback position; timed lyrics only.
+function syncLyrics() {
+  if (!npvOpen || !lyricsData || !lyricsData.timed || !last) return;
+  let pos = last.position_ms || 0;
+  if (last.state === "playing") pos += Date.now() - lastAt;
+  let idx = -1;
+  for (let i = 0; i < lyricsData.lines.length; i++) {
+    const st = lyricsData.lines[i].start_ms;
+    if (st == null) continue;
+    if (st <= pos) idx = i; else break;
+  }
+  if (idx === lyricLine) return;
+  lyricLine = idx;
+  const box = $("npv-lyrics");
+  if (!box) return;
+  const lines = [...box.querySelectorAll(".ln")];
+  lines.forEach((d, i) => d.classList.toggle("on", i === idx));
+  if (idx < 0 || !lines.length) return;
+  // Hold the active line a fixed few rows down the panel. scrollIntoView with
+  // "nearest" only moves the minimum distance, so the line creeps to the
+  // bottom edge and stays pinned there with nothing upcoming visible below it.
+  // Anchoring the line LYRIC_LEAD rows earlier to the top keeps the sung and
+  // unsung sides of the panel in proportion.
+  const anchor = lines[Math.max(0, idx - LYRIC_LEAD)];
+  box.scrollTo({ top: anchor.offsetTop - lines[0].offsetTop, behavior: "smooth" });
 }
 
 // ---- queue drawer ----
@@ -2090,6 +2352,8 @@ function paint() {
   $("ic-rp").style.display = rp === 1 ? "none" : "";
   $("ic-rp1").style.display = rp === 1 ? "" : "none";
   $("sh-btn").classList.toggle("on", !!last.shuffle);
+  renderNowPlaying();
+  syncLyrics();
   const rk = t ? t.rating_key : null;
   if (rk !== nowRatingKey) { nowRatingKey = rk; markNow(); }
 }
@@ -2255,12 +2519,20 @@ fn split_url(url: &str) -> (String, String, u16) {
 fn to_queued(t: &Metadata) -> QueuedTrack {
     QueuedTrack {
         title: t.title.clone(),
-        artist: t.grandparent_title.clone(),
+        artist: t
+            .original_title
+            .clone()
+            .or_else(|| t.grandparent_title.clone()),
+        album: t.parent_title.clone(),
         key: t
             .key
             .clone()
             .unwrap_or_else(|| format!("/library/metadata/{}", t.rating_key)),
         rating_key: t.rating_key.clone(),
+        album_rating_key: t.parent_rating_key.clone(),
+        artist_rating_key: t.grandparent_rating_key.clone(),
+        artist_thumb: t.grandparent_thumb.clone(),
+        user_rating: t.user_rating,
         play_queue_item_id: t.play_queue_item_id,
         duration_ms: t.duration.unwrap_or(0),
         thumb: t.thumb.clone().or_else(|| t.parent_thumb.clone()),
@@ -3041,6 +3313,176 @@ async fn shuffle_library_handler(
     }
 }
 
+// POST /api/rate?rating_key=X&rating=N — Plex's 0-10 scale, shown as five
+// stars. -1 removes the rating: sending 0 instead stores a zero rating, which
+// reads back as 0.0 rather than absent. Verified against PMS 1.43.4.
+async fn rate_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<Params>,
+) -> axum::response::Response {
+    let Some(rk) = params.get("rating_key") else {
+        return (StatusCode::BAD_REQUEST, "missing rating_key").into_response();
+    };
+    let rating: f32 = params
+        .get("rating")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(-1.0f32)
+        .clamp(-1.0, 10.0);
+    let url = format!(
+        "{}/:/rate?key={}&identifier=com.plexapp.plugins.library&rating={rating}",
+        state.server_url,
+        urlencoding::encode(rk),
+    );
+    let req = state.client.put(&url).header("X-Plex-Token", &state.token);
+    match plex_headers(req).send().await {
+        Ok(r) if r.status().is_success() => {
+            // The player's copy of the track still holds the old rating, and
+            // nothing else will correct it until the queue changes.
+            let _ = state.player_tx.send(PlayerCmd::SetRating(rk.clone(), rating));
+            StatusCode::OK.into_response()
+        }
+        Ok(r) => (
+            StatusCode::BAD_GATEWAY,
+            format!("rating failed: {}", r.status()),
+        )
+            .into_response(),
+        Err(e) => err_response(e.into()),
+    }
+}
+
+#[derive(Serialize, Default)]
+struct LyricLine {
+    start_ms: Option<u64>,
+    text: String,
+}
+
+#[derive(Serialize, Default)]
+struct Lyrics {
+    provider: Option<String>,
+    // Whether lines carry timings; untimed lyrics are shown as a plain block.
+    timed: bool,
+    lines: Vec<LyricLine>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct PlexSpan {
+    text: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct PlexLine {
+    #[serde(rename = "startOffset")]
+    start_offset: Option<u64>,
+    #[serde(rename = "Span", default)]
+    span: Vec<PlexSpan>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct PlexLyrics {
+    provider: Option<String>,
+    timed: Option<serde_json::Value>,
+    #[serde(rename = "Line", default)]
+    line: Vec<PlexLine>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct LyricsContainer {
+    // PMS returns an array here; accept a lone object too rather than fail.
+    #[serde(rename = "Lyrics", default)]
+    lyrics: serde_json::Value,
+}
+
+#[derive(Deserialize, Debug)]
+struct LyricsResponse {
+    #[serde(rename = "MediaContainer")]
+    media_container: LyricsContainer,
+}
+
+// GET /api/lyrics/:rating_key — empty when the track has none, which is the
+// common case; the UI hides the tab rather than showing an error.
+async fn lyrics_handler(
+    State(state): State<AppState>,
+    Path(rating_key): Path<String>,
+) -> axum::response::Response {
+    let track = match fetch_item(&state.client, &state.server_url, &state.token, &rating_key).await
+    {
+        Ok(t) => t,
+        Err(e) => return err_response(e),
+    };
+    // A track can carry several lyric streams and some of them 404 — PMS lists
+    // stream ids that no longer resolve. So try each in turn, timed ("lrc")
+    // first, and take the first that actually returns lines.
+    let mut keys: Vec<(bool, String)> = track
+        .media
+        .iter()
+        .flat_map(|m| m.part.iter())
+        .flat_map(|p| p.stream.iter())
+        .filter(|s| s.stream_type == Some(STREAM_TYPE_LYRIC))
+        .filter_map(|s| {
+            s.key
+                .clone()
+                .map(|k| (s.format.as_deref() == Some("lrc"), k))
+        })
+        .collect();
+    keys.sort_by_key(|(is_lrc, _)| !is_lrc);
+
+    for (_, stream_key) in keys {
+        let url = format!("{}{stream_key}?includeInlineAttribution=1", state.server_url);
+        let Ok(r) = plex_get_json::<LyricsResponse>(&state.client, &url, &state.token).await
+        else {
+            continue; // dead stream id; try the next one
+        };
+        let lyrics = to_lyrics(r.media_container.lyrics);
+        if !lyrics.lines.is_empty() {
+            return Json(lyrics).into_response();
+        }
+    }
+    Json(Lyrics::default()).into_response()
+}
+
+fn to_lyrics(value: serde_json::Value) -> Lyrics {
+    // PMS returns an array here; tolerate a bare object too.
+    let first = match value {
+        serde_json::Value::Array(mut a) if !a.is_empty() => a.remove(0),
+        v @ serde_json::Value::Object(_) => v,
+        _ => return Lyrics::default(),
+    };
+    let parsed: PlexLyrics = serde_json::from_value(first).unwrap_or_default();
+    Lyrics {
+        provider: parsed.provider,
+        timed: parsed.timed.as_ref().map(truthy).unwrap_or(false),
+        lines: parsed
+            .line
+            .into_iter()
+            .filter_map(|l| {
+                // Timed lyrics include zero-length marker lines carrying no
+                // Span at all; they would render as blank rows and could take
+                // the highlight away from a real line.
+                let text = l
+                    .span
+                    .into_iter()
+                    .filter_map(|s| s.text)
+                    .collect::<Vec<_>>()
+                    .join("");
+                (!text.trim().is_empty()).then_some(LyricLine {
+                    start_ms: l.start_offset,
+                    text,
+                })
+            })
+            .collect(),
+    }
+}
+
+// PMS is inconsistent about whether flags come back as 1, "1" or true.
+fn truthy(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::String(s) => s == "1" || s.eq_ignore_ascii_case("true"),
+        serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0) != 0.0,
+        _ => false,
+    }
+}
+
 // POST /api/repeat?v=0|1|2 — off, this track, the queue.
 async fn repeat_handler(
     State(state): State<AppState>,
@@ -3633,6 +4075,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/sections/:key/albums", get(section_albums_handler))
         .route("/api/sections/:key/tracks", get(section_tracks_handler))
         .route("/api/shuffle-library/:key", post(shuffle_library_handler))
+        .route("/api/rate", post(rate_handler))
+        .route("/api/lyrics/:rating_key", get(lyrics_handler))
         .route("/api/search", get(search_handler))
         .route("/api/play/:rating_key", post(play_handler))
         .route("/api/play-album/:rating_key", post(play_album_handler))
