@@ -238,6 +238,14 @@ Not planned: video, photos, Tidal, speaker groups.
 - ALSA card numbers shift when devices are enabled or disabled in
   `/boot/config.txt`. Re-check `aplay -l` before assuming the code is
   wrong.
+- On the static musl build, alsa-lib's config directory is compiled in.
+  `Dockerfile.armv7-musl` points it at `/usr/share/alsa`, where the Pi keeps
+  `alsa.conf`; the configure default is the build prefix inside the image,
+  which does not exist on the target. Get it wrong and opening the default
+  PCM fails on a machine where `aplay` works fine — so it reads as a dead
+  audio device and sends you chasing card numbers and mixer switches rather
+  than the build. Only the musl target is affected; the gnu builds link
+  against the system libasound and use its paths.
 - Over Remote Desktop, Windows redirects audio to the connecting machine
   and exposes a virtual device with a narrow format list.
 - Claim codes from plex.tv/claim expire in a few minutes.
