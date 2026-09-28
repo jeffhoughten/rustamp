@@ -1558,7 +1558,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
   .card:hover .art { transform: scale(1.03); }
   .card .t { margin-top: 8px; font-weight: 600; font-size: 14px;
              white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .card .s { color: var(--muted); font-size: 12px; }
+  .card .s { color: var(--muted); font-size: 12px;
+             white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
   .tracks { list-style: none; margin: 0; padding: 0; }
   .tracks li {
@@ -1966,7 +1967,11 @@ async function sectionArtists(key) {
   const items = (await listing(`/api/sections/${key}`)).MediaContainer.Metadata || [];
   const g = document.createElement("div"); g.className = "grid";
   items.forEach(a => {
-    const card = el(`<div class="card round">${art(a.thumb, 300, "art", true)}<div class="t">${esc(a.title)}</div><div class="s">${esc(a.type)}</div></div>`);
+    // Genre rather than the type, which just said "artist" on every card.
+    // PMS sends it on the section listing (excludeFields=summary keeps it),
+    // and it is blank for artists that have none.
+    const genre = ((a.Genre || [])[0] || {}).tag || "";
+    const card = el(`<div class="card round">${art(a.thumb, 300, "art", true)}<div class="t">${esc(a.title)}</div><div class="s">${esc(genre)}</div></div>`);
     card.onclick = () => go(a.title, () => showArtist(a));
     g.appendChild(card);
   });
