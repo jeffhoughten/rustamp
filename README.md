@@ -61,6 +61,7 @@ include the ALSA headers this needs at link time, which is what the
 | `armv7-unknown-linux-gnueabihf` | 32-bit Raspberry Pi OS (Pi 2/3/4/5, Zero 2) | `docker build -t rustamp-cross-armv7 -f Dockerfile.armv7 .` | `cross build --release --target armv7-unknown-linux-gnueabihf` |
 | `aarch64-unknown-linux-gnu` | 64-bit Raspberry Pi OS (Pi 3/4/5, Zero 2) | `docker build -t rustamp-cross-aarch64 -f Dockerfile.aarch64 .` | `cross build --release --target aarch64-unknown-linux-gnu` |
 | `x86_64-unknown-linux-gnu` | Linux PC | `docker build -t rustamp-cross-x86_64 -f Dockerfile.x86_64 .` | `cross build --release --target x86_64-unknown-linux-gnu` |
+| `armv7-unknown-linux-musleabihf` | 32-bit Raspberry Pi OS, static — see below | `docker build -t rustamp-cross-armv7-musl -f Dockerfile.armv7-musl .` | `cross build --release --target armv7-unknown-linux-musleabihf` |
 
 Binaries land in `target/<target>/release/plexamp-rs`.
 
@@ -72,7 +73,23 @@ armv7-...` looks for an ARM linker on the host and fails with
 in the cross image, so it needs a target system at least that new. These
 images generally produce binaries that run on current Debian, Ubuntu, and
 Raspberry Pi OS, but an older distro may fail with `GLIBC_2.xx not found`.
-Building natively on the target avoids this.
+Building natively on the target avoids this — or use the musl target below,
+which has no glibc dependency at all.
+
+**Static musl build (32-bit Pi):** `armv7-unknown-linux-musleabihf` links
+everything statically, so the binary carries no glibc dependency and runs on
+old Raspberry Pi OS installs that the gnueabihf build fails on. Its image
+takes longer to build than the others: no distro ships a musl armhf
+`libasound`, so `Dockerfile.armv7-musl` compiles alsa-lib from source
+against the image's musl toolchain. Only the PCM and mixer parts are built —
+the sequencer, rawmidi, UCM, topology and Python bindings are disabled,
+since the player uses none of them.
+
+The image points alsa-lib's config directory at `/usr/share/alsa`, which is
+where the Pi keeps `alsa.conf`, not at the build prefix inside the image.
+Without that a static binary cannot find its configuration and opening the
+default PCM fails at runtime, which looks like a broken audio device rather
+than a build problem.
 
 **CPU tuning:** `.cargo/config.toml` sets `target-cpu` per target —
 `cortex-a7` for armv7 (Pi 2) and `cortex-a76` for aarch64 (Pi 5). That ties
