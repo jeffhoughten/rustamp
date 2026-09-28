@@ -1572,6 +1572,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
   .tracks .d { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 13px; }
 
   .empty { color: var(--muted); padding: 40px 0; text-align: center; }
+  .busy { color: var(--muted); padding: 12px 0; font-size: 14px; }
 
   /* Now playing view */
   #npv { display: none; }
@@ -1863,6 +1864,32 @@ function toast(msg) {
   clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), 5000);
 }
 
+// Listings run to megabytes and barely change within a session, so keep what
+// we have already parsed. Walking back up the breadcrumbs should cost nothing.
+const listings = new Map();
+const LISTING_TTL = 5 * 60 * 1000;
+async function listing(url) {
+  const hit = listings.get(url);
+  if (hit && Date.now() - hit.at < LISTING_TTL) return hit.data;
+  const data = await (await fetch(url)).json();
+  listings.set(url, { at: Date.now(), data });
+  return data;
+}
+
+// Says "loading" only once the wait is long enough to notice, so a cached
+// view doesn't flash it.
+let busyTimer;
+function setBusy(on) {
+  clearTimeout(busyTimer);
+  const existing = $("busy");
+  if (!on) { if (existing) existing.remove(); return; }
+  if (existing) return;
+  busyTimer = setTimeout(() => {
+    if ($("busy")) return;
+    $("content").prepend(el(`<div class="busy" id="busy">Loading…</div>`));
+  }, 150);
+}
+
 let path = [];            // breadcrumb stack: {label, load: () => Promise}
 let currentAlbumKey = null;
 let nowRatingKey = null;
@@ -1888,7 +1915,7 @@ function setHero(html) { $("hero").innerHTML = html || ""; }
 async function showSections() {
   const my = navId;
   setHero("");
-  const items = await (await fetch("/api/sections")).json();
+  const items = await listing("/api/sections");
   if (stale(my)) return;
   if (items.length === 1) return go(items[0].title, () => showSection(items[0].key));
   const g = document.createElement("div"); g.className = "grid";
@@ -1907,11 +1934,16 @@ let sectionView = "artists";
 async function showSection(key, view) {
   if (view) sectionView = view;
   const my = ++navId;
-  setHero("");
   const load = { artists: sectionArtists, albums: sectionAlbums, songs: sectionSongs }[sectionView];
   let body;
-  try { body = await load(key); } catch (e) { return toast(String(e)); }
+  setBusy(true);
+  // Leave the previous view on screen while this loads, rather than blanking
+  // it and showing nothing for seconds.
+  try { body = await load(key); }
+  catch (e) { setBusy(false); return toast(String(e)); }
+  finally { setBusy(false); }
   if (stale(my)) return;
+  setHero("");
 
   const bar = el(`<div class="viewbar"><div class="tabs">
       <button class="tab" data-v="artists">Artists</button>
@@ -1931,7 +1963,7 @@ async function showSection(key, view) {
 }
 
 async function sectionArtists(key) {
-  const items = (await (await fetch(`/api/sections/${key}`)).json()).MediaContainer.Metadata || [];
+  const items = (await listing(`/api/sections/${key}`)).MediaContainer.Metadata || [];
   const g = document.createElement("div"); g.className = "grid";
   items.forEach(a => {
     const card = el(`<div class="card round">${art(a.thumb, 300, "art", true)}<div class="t">${esc(a.title)}</div><div class="s">${esc(a.type)}</div></div>`);
@@ -1942,7 +1974,7 @@ async function sectionArtists(key) {
 }
 
 async function sectionAlbums(key) {
-  const items = (await (await fetch(`/api/sections/${key}/albums`)).json()).MediaContainer.Metadata || [];
+  const items = (await listing(`/api/sections/${key}/albums`)).MediaContainer.Metadata || [];
   const g = document.createElement("div"); g.className = "grid";
   items.forEach(al => {
     const card = el(`<div class="card">${art(al.thumb, 300, "art", true)}<div class="t">${esc(al.title)}</div><div class="s">${esc(al.parentTitle || "")}</div></div>`);
@@ -1953,7 +1985,7 @@ async function sectionAlbums(key) {
 }
 
 async function sectionSongs(key) {
-  const items = (await (await fetch(`/api/sections/${key}/tracks`)).json()).MediaContainer.Metadata || [];
+  const items = (await listing(`/api/sections/${key}/tracks`)).MediaContainer.Metadata || [];
   const ul = document.createElement("ul"); ul.className = "tracks";
   items.forEach(t => {
     const li = el(`<li data-rk="${t.ratingKey}"><span class="n">&#9834;</span>
@@ -1982,7 +2014,7 @@ async function showArtist(artist) {
       <button class="btn" onclick="post('/api/play-album/${artist.ratingKey}')">&#9654; Play all</button>
       <button class="btn ghost" onclick="post('/api/play-album/${artist.ratingKey}?shuffle=1')">Shuffle</button>
     </div></div></div>`);
-  const albums = (await (await fetch(`/api/browse/${artist.ratingKey}`)).json()).MediaContainer.Metadata || [];
+  const albums = (await listing(`/api/browse/${artist.ratingKey}`)).MediaContainer.Metadata || [];
   if (stale(my)) return;
   const g = document.createElement("div"); g.className = "grid";
   albums.forEach(al => {
@@ -2006,7 +2038,7 @@ async function showAlbum(album) {
       <button class="btn ghost" onclick="post('/api/queue/add?rating_key=${album.ratingKey}')">Add to queue</button>
     </div>
   </div></div>`);
-  const tracks = (await (await fetch(`/api/browse/${album.ratingKey}`)).json()).MediaContainer.Metadata || [];
+  const tracks = (await listing(`/api/browse/${album.ratingKey}`)).MediaContainer.Metadata || [];
   if (stale(my)) return;
   const ul = document.createElement("ul"); ul.className = "tracks";
   tracks.forEach((t, i) => {
@@ -2027,7 +2059,12 @@ async function showAlbum(album) {
   markNow();
 }
 
-function swap(node) { const c = $("content"); c.innerHTML = ""; c.appendChild(node); lazyArt(c); }
+function swap(node) {
+  // Artwork queued for the view being replaced is dead weight; pumpArt skips
+  // detached images but the queue would still be walked.
+  artQueue.length = 0;
+  const c = $("content"); c.innerHTML = ""; c.appendChild(node); lazyArt(c);
+}
 function el(html) { const t = document.createElement("template"); t.innerHTML = html.trim(); return t.content.firstChild; }
 function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 function markNow() {
@@ -3067,11 +3104,18 @@ async fn sections_handler(State(state): State<AppState>) -> impl IntoResponse {
 
 // These return PMS's own MediaContainer JSON (the browser reads
 // .MediaContainer.Metadata), cached for a few minutes.
+// excludeFields=summary is worth ~10x here: artist biographies are the bulk of
+// this payload (3.2MB of 3.6MB on a 589-artist library) and nothing displays
+// them. Measured against PMS 1.43.4.
 async fn section_items_handler(
     State(state): State<AppState>,
     Path(section_key): Path<String>,
 ) -> axum::response::Response {
-    cached_listing(&state, &format!("/library/sections/{section_key}/all")).await
+    cached_listing(
+        &state,
+        &format!("/library/sections/{section_key}/all?excludeFields=summary"),
+    )
+    .await
 }
 
 // Flat listings across the whole section, sorted by title, for browsing by
@@ -3098,7 +3142,11 @@ async fn section_tracks_handler(
 ) -> axum::response::Response {
     cached_listing(
         &state,
-        &format!("/library/sections/{section_key}/all?type=10&sort=title"),
+        // excludeElements=Media drops about a fifth of this payload. The song
+        // list shows title, artist and duration, and plays through
+        // /api/play/{ratingKey}, which builds the queue server-side - the
+        // part keys are never read here.
+        &format!("/library/sections/{section_key}/all?type=10&sort=title&excludeElements=Media"),
     )
     .await
 }
